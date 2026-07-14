@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Sparkles, Calendar, Clock, Plus } from 'lucide-react';
 import { ItineraryItem, EventCategory } from '../types';
+import { defaultDurationMinutes } from '../lib/schedule';
 import { VENUES } from '../data/venues';
 
 interface CustomEventFormProps {
@@ -48,18 +49,22 @@ export default function CustomEventForm({ onAddCustomItem }: CustomEventFormProp
     e.preventDefault();
     if (!title.trim()) return;
 
+    const venue = venueId ? VENUES.find((v) => v.id === venueId) : undefined;
+    const guestCount = venue ? Math.min(guests, venue.capacity) : guests;
+
     onAddCustomItem({
       title: title.trim(),
       category,
       location,
       date,
       time,
-      guests,
+      guests: guestCount,
       notes,
       basePrice: baseCost,
       pricePerGuest,
-      calculatedPrice: estimatedTotal,
+      calculatedPrice: baseCost + pricePerGuest * guestCount,
       venueId: venueId || undefined,
+      durationMinutes: defaultDurationMinutes(category),
     });
 
     setTitle('');

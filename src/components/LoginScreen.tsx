@@ -169,7 +169,8 @@ export default function LoginScreen({ onLogin, onClose }: LoginScreenProps) {
             Villa &amp; Vale
           </h1>
           <p className="text-xs text-dark-text-tertiary">
-            Simulated Secure Portal for Bespoke Itinerary Management
+            Demo portal — password is not verified. Any non-empty password works with a known email.
+            Guest plans can be brought onto an account at sign-in.
           </p>
         </div>
 
@@ -359,11 +360,11 @@ export default function LoginScreen({ onLogin, onClose }: LoginScreenProps) {
         )}
 
         <div className="relative flex py-2 items-center">
-          <div className="flex-grow border-t border-dark-border/40"></div>
-          <span className="flex-shrink mx-4 text-[9px] text-dark-text-tertiary uppercase tracking-widest font-black">
+          <div className="grow border-t border-dark-border/40"></div>
+          <span className="shrink mx-4 text-[9px] text-dark-text-tertiary uppercase tracking-widest font-black">
             Quick Login Profiles
           </span>
-          <div className="flex-grow border-t border-dark-border/40"></div>
+          <div className="grow border-t border-dark-border/40"></div>
         </div>
 
         {/* Quick Profiles grid list */}

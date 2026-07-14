@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   MapPin,
@@ -41,7 +41,15 @@ import DayTimeline from './components/DayTimeline';
 import InquiryForm from './components/InquiryForm';
 import LandingPage from './components/LandingPage';
 import LoginScreen from './components/LoginScreen';
-import { findConflicts, groupByDate, itemHasConflict, sortItineraryChronologically } from './lib/schedule';
+import {
+  defaultDurationMinutes,
+  findConflicts,
+  findTransitGaps,
+  groupByDate,
+  itemHasConflict,
+  itemHasTransitGap,
+  sortItineraryChronologically,
+} from './lib/schedule';
 import { downloadIcs } from './lib/export';
 import {
   evaluateOutdoorWeatherRisks,
@@ -89,17 +97,69 @@ function repriceItem(item: ItineraryItem): ItineraryItem {
   const associated = item.activityId
     ? CATALOG_ACTIVITIES.find((a) => a.id === item.activityId)
     : undefined;
-  const maxGuests = associated?.maxGuests ?? 500;
+  const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
+  const maxGuests = Math.min(
+    associated?.maxGuests ?? 500,
+    venue?.capacity ?? Number.POSITIVE_INFINITY
+  );
   const guests = Math.min(maxGuests, Math.max(1, item.guests));
   let calculatedPrice = item.calculatedPrice;
+  let durationMinutes =
+    typeof item.durationMinutes === 'number' &&
+    Number.isFinite(item.durationMinutes) &&
+    item.durationMinutes > 0
+      ? Math.round(item.durationMinutes)
+      : defaultDurationMinutes(item.category);
   if (associated) {
     calculatedPrice = associated.basePrice + guests * associated.pricePerGuest;
+    durationMinutes = associated.durationMinutes;
   } else {
     const base = item.basePrice ?? item.calculatedPrice;
     const ppg = item.pricePerGuest ?? 0;
     calculatedPrice = base + ppg * guests;
   }
-  return { ...item, guests, calculatedPrice };
+  return { ...item, guests, calculatedPrice, durationMinutes };
+}
+
+function guestItineraryCount(): number {
+  try {
+    const raw = localStorage.getItem('villa_hotel_itinerary_guest');
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function userHasItinerary(userId: string): boolean {
+  try {
+    const raw = localStorage.getItem(`villa_hotel_itinerary_${userId}`);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function migrateGuestItineraryToUser(userId: string): void {
+  const guestRaw = localStorage.getItem('villa_hotel_itinerary_guest');
+  if (!guestRaw) return;
+  try {
+    const guestItems = JSON.parse(guestRaw);
+    if (!Array.isArray(guestItems) || guestItems.length === 0) return;
+    if (userHasItinerary(userId)) return;
+    localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(guestItems));
+    localStorage.removeItem('villa_hotel_itinerary_guest');
+    const guestName = localStorage.getItem('villa_hotel_planner_name_guest');
+    if (guestName) {
+      localStorage.setItem(`villa_hotel_planner_name_${userId}`, guestName);
+      localStorage.removeItem('villa_hotel_planner_name_guest');
+    }
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 export default function App() {
@@ -124,11 +184,31 @@ export default function App() {
   const [showSummaryModal, setShowSummaryModal] = useState(false);
   const [isSavedAlert, setIsSavedAlert] = useState(false);
   const savedAlertTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [lastSaved, setLastSaved] = useState<string>('');
+  const [isHydrating, setIsHydrating] = useState(true);
 
   // Theme State: 'auto' | 'light' | 'dark'
   const [theme, setTheme] = useState<'auto' | 'light' | 'dark'>(() => {
     return (localStorage.getItem('villa-vale-theme') as 'auto' | 'light' | 'dark') || 'auto';
   });
+
+  // Weather Widget State
+  const [weatherLocation, setWeatherLocation] = useState('Amalfi Coast, Italy');
+  const [weatherRefreshKey, setWeatherRefreshKey] = useState(0);
+  const [weatherData, setWeatherData] = useState<any>(null);
+  const [isWeatherLoading, setIsWeatherLoading] = useState(false);
+  const [weatherError, setWeatherError] = useState<string | null>(null);
+  const [weatherWarning, setWeatherWarning] = useState<string | null>(null);
+
+  // Mood Board Generation State
+  const [moodPrompt, setMoodPrompt] = useState(
+    'An elegant cliffside ocean ceremony decorated with white orchids and soft linen drapes'
+  );
+  const [generatedMoodUrl, setGeneratedMoodUrl] = useState<string>(() => {
+    return localStorage.getItem('villa_hotel_mood_board_img') || '';
+  });
+  const [isGeneratingImage, setIsGeneratingImage] = useState(false);
+  const [imageGenError, setImageGenError] = useState<string | null>(null);
 
   // Apply Theme class to :root so Tailwind @custom-variant dark works
   useEffect(() => {
@@ -161,17 +241,22 @@ export default function App() {
     return () => mq.removeEventListener('change', onChange);
   }, [theme]);
 
-  // Load user-specific itinerary and planner name whenever the user signs in
-  useEffect(() => {
+  // Hydrate before paint so persist effects never write the prior user's itinerary into the new key
+  useLayoutEffect(() => {
     const userId = currentUser ? currentUser.id : 'guest';
+    setIsHydrating(true);
+    setItinerary([]);
 
-    // Load itinerary
     const savedItinerary = localStorage.getItem(`villa_hotel_itinerary_${userId}`);
     if (savedItinerary) {
       try {
         const parsed = JSON.parse(savedItinerary);
         if (Array.isArray(parsed)) {
-          setItinerary(parsed.filter(isValidItineraryItem).map(normalizeItineraryItem));
+          setItinerary(
+            parsed
+              .filter(isValidItineraryItem)
+              .map((item) => repriceItem(normalizeItineraryItem(item)))
+          );
         } else {
           setItinerary([]);
         }
@@ -183,50 +268,31 @@ export default function App() {
       setItinerary([]);
     }
 
-    // Load planner name
     const savedName = localStorage.getItem(`villa_hotel_planner_name_${userId}`);
-    setPlannerName(savedName || (currentUser ? `${currentUser.name}'s Celebration` : 'Signature Occasion'));
-    
-    // Load last saved
+    setPlannerName(
+      savedName || (currentUser ? `${currentUser.name}'s Celebration` : 'Signature Occasion')
+    );
+
     const savedTime = localStorage.getItem(`villa_hotel_last_saved_${userId}`);
     setLastSaved(savedTime || '');
+    setIsHydrating(false);
   }, [currentUser]);
 
-  // Sync itinerary to localStorage
+  // Sync itinerary after hydrate completes (layout hydrate avoids cross-user overwrite)
   useEffect(() => {
+    if (isHydrating) return;
     const userId = currentUser ? currentUser.id : 'guest';
     localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(itinerary));
-  }, [itinerary, currentUser]);
+  }, [itinerary, isHydrating, currentUser]);
 
-  // Sync planner name to localStorage
   useEffect(() => {
+    if (isHydrating) return;
     const userId = currentUser ? currentUser.id : 'guest';
     localStorage.setItem(`villa_hotel_planner_name_${userId}`, plannerName);
-  }, [plannerName, currentUser]);
+  }, [plannerName, isHydrating, currentUser]);
 
-  // Auto-Save Last Saved Time State
-  const [lastSaved, setLastSaved] = useState<string>('');
-
-  // Weather Widget State
-  const [weatherLocation, setWeatherLocation] = useState('Amalfi Coast, Italy');
-  const [weatherRefreshKey, setWeatherRefreshKey] = useState(0);
-  const [weatherData, setWeatherData] = useState<any>(null);
-  const [isWeatherLoading, setIsWeatherLoading] = useState(false);
-  const [weatherError, setWeatherError] = useState<string | null>(null);
-  const [weatherWarning, setWeatherWarning] = useState<string | null>(null);
-
-  // Mood Board Generation State
-  const [moodPrompt, setMoodPrompt] = useState(
-    'An elegant cliffside ocean ceremony decorated with white orchids and soft linen drapes'
-  );
-  const [generatedMoodUrl, setGeneratedMoodUrl] = useState<string>(() => {
-    return localStorage.getItem('villa_hotel_mood_board_img') || '';
-  });
-  const [isGeneratingImage, setIsGeneratingImage] = useState(false);
-  const [imageGenError, setImageGenError] = useState<string | null>(null);
-
-  // Auto-save every 30 seconds
   useEffect(() => {
+    if (isHydrating) return;
     const userId = currentUser ? currentUser.id : 'guest';
     const interval = setInterval(() => {
       localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(itinerary));
@@ -242,7 +308,7 @@ export default function App() {
     }, 30000);
 
     return () => clearInterval(interval);
-  }, [itinerary, plannerName, currentUser]);
+  }, [itinerary, plannerName, currentUser, isHydrating]);
 
   // Fetch weather forecast with AbortController (ignore aborted / stale responses)
   useEffect(() => {
@@ -253,6 +319,7 @@ export default function App() {
       setIsWeatherLoading(true);
       setWeatherError(null);
       setWeatherWarning(null);
+      setWeatherData(null);
       try {
         const response = await fetch(
           `/api/weather?location=${encodeURIComponent(weatherLocation)}`,
@@ -272,17 +339,14 @@ export default function App() {
             setWeatherWarning(null);
           }
           setWeatherError(null);
-        } else if (resData.fallback || !resData.success) {
-          setWeatherWarning(
-            resData.error || 'Live forecast unavailable for this destination.'
-          );
-          setWeatherError(null);
         } else {
+          setWeatherData(null);
           setWeatherError(resData.error || 'Failed to fetch weather forecast.');
         }
       } catch (err: any) {
         if (err?.name === 'AbortError' || cancelled) return;
         console.error('Weather fetch error:', err);
+        setWeatherData(null);
         setWeatherError('Network error while querying weather.');
       } finally {
         if (!cancelled && !controller.signal.aborted) {
@@ -345,10 +409,6 @@ export default function App() {
     setImageGenError(null);
   };
 
-  useEffect(() => {
-    localStorage.setItem('villa_hotel_planner_name', plannerName);
-  }, [plannerName]);
-
   // Body scroll lock while summary modal is open
   useEffect(() => {
     if (!showSummaryModal) return;
@@ -371,6 +431,7 @@ export default function App() {
 
   // Handle adding pre-defined activity to itinerary
   const handleAddActivity = (activity: EventActivity) => {
+    if (isHydrating) return;
     setItinerary((prev) => {
       if (prev.some((item) => item.activityId === activity.id)) return prev;
 
@@ -390,6 +451,7 @@ export default function App() {
         notes: '',
         calculatedPrice: activity.basePrice + guests * activity.pricePerGuest,
         venueId: defaultVenue ? defaultVenue.id : undefined,
+        durationMinutes: activity.durationMinutes,
       };
 
       return [...prev, newItem];
@@ -398,6 +460,7 @@ export default function App() {
 
   // Handle adding custom-built activity
   const handleAddCustomItem = (customItem: Omit<ItineraryItem, 'id'>) => {
+    if (isHydrating) return;
     setItinerary((prev) => [
       ...prev,
       {
@@ -409,6 +472,7 @@ export default function App() {
 
   // Merge patches against latest state to avoid lost concurrent field edits
   const handleUpdateItem = (id: string, patch: Partial<ItineraryItem>) => {
+    if (isHydrating) return;
     setItinerary((prev) =>
       prev.map((item) => {
         if (item.id !== id) return item;
@@ -417,6 +481,14 @@ export default function App() {
           const firstMatching = VENUES.find((v) => v.type === patch.location);
           updated.venueId = firstMatching ? firstMatching.id : undefined;
         }
+        if (patch.venueId !== undefined) {
+          const venue = patch.venueId
+            ? VENUES.find((v) => v.id === patch.venueId)
+            : undefined;
+          if (venue && updated.guests > venue.capacity) {
+            updated.guests = venue.capacity;
+          }
+        }
         return repriceItem(updated);
       })
     );
@@ -424,11 +496,13 @@ export default function App() {
 
   // Handle removing itinerary item
   const handleRemoveItem = (id: string) => {
+    if (isHydrating) return;
     setItinerary((prev) => prev.filter((item) => item.id !== id));
   };
 
   // Clear all itinerary items
   const handleClearAll = () => {
+    if (isHydrating) return;
     if (window.confirm('Are you sure you want to clear your entire event itinerary?')) {
       setItinerary([]);
     }
@@ -436,15 +510,17 @@ export default function App() {
 
   // Trigger temporary success notification
   const handleSavePlanner = () => {
-    localStorage.setItem('villa_hotel_itinerary', JSON.stringify(itinerary));
-    localStorage.setItem('villa_hotel_planner_name', plannerName);
+    if (isHydrating) return;
+    const userId = currentUser ? currentUser.id : 'guest';
+    localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(itinerary));
+    localStorage.setItem(`villa_hotel_planner_name_${userId}`, plannerName);
     const now = new Date();
     const timeStr = now.toLocaleTimeString([], {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
     });
-    localStorage.setItem('villa_hotel_last_saved', timeStr);
+    localStorage.setItem(`villa_hotel_last_saved_${userId}`, timeStr);
     setLastSaved(timeStr);
     setIsSavedAlert(true);
     if (savedAlertTimer.current) clearTimeout(savedAlertTimer.current);
@@ -516,8 +592,27 @@ export default function App() {
   ].filter((item) => item.value > 0);
 
   const scheduleConflicts = findConflicts(itinerary);
+  const transitGaps = findTransitGaps(itinerary);
   const dayGroups = groupByDate(itinerary);
   const chronologicalItinerary = sortItineraryChronologically(itinerary);
+
+  const handleAuthenticated = (user: UserProfile) => {
+    const guestCount = guestItineraryCount();
+    if (guestCount > 0) {
+      if (userHasItinerary(user.id)) {
+        window.alert(
+          'Guest itinerary kept separate — this account already has saved events. Continue as this account without overwriting.'
+        );
+      } else {
+        const bring = window.confirm(
+          `You have ${guestCount} guest event(s). Bring them onto this account?`
+        );
+        if (bring) migrateGuestItineraryToUser(user.id);
+      }
+    }
+    setCurrentUser(user);
+    setShowLogin(false);
+  };
 
   if (!showPlanner) {
     return <LandingPage onEnter={() => setShowPlanner(true)} />;
@@ -526,10 +621,7 @@ export default function App() {
   if (showLogin) {
     return (
       <LoginScreen
-        onLogin={(user) => {
-          setCurrentUser(user);
-          setShowLogin(false);
-        }}
+        onLogin={handleAuthenticated}
         onClose={() => setShowLogin(false)}
       />
     );
@@ -755,16 +847,16 @@ export default function App() {
         </motion.div>
       </section>
 
-      {/* Secondary strip: metrics + weather — desktop/tablet; deferred on phones */}
+      {/* Secondary strip: full metrics + weather on desktop; compact weather on phone */}
       <section
-        className="hidden lg:block bg-dark-bg border-b border-dark-border px-6 py-5 shrink-0"
+        className="bg-dark-bg border-b border-dark-border px-4 sm:px-6 py-3 lg:py-5 shrink-0"
         id="hero-secondary-strip"
       >
         <div
           className="max-w-7xl mx-auto flex flex-col lg:flex-row lg:items-stretch gap-4"
           id="hero-right-side-board"
         >
-          <div className="flex flex-wrap gap-3 flex-1" id="quick-metrics-board">
+          <div className="hidden lg:flex flex-wrap gap-3 flex-1" id="quick-metrics-board">
             <div className="bg-dark-card border border-dark-border rounded-xl p-3 text-center min-w-[90px] flex-1">
               <span className="block text-[11px] uppercase tracking-widest font-bold text-dark-text-tertiary">
                 Total Items
@@ -830,10 +922,17 @@ export default function App() {
 
             {weatherWarning && weatherData && (
               <div
-                className="text-[11px] text-amber-600 dark:text-amber-300 font-semibold bg-amber-500/10 border border-amber-500/30 px-2 py-1.5 rounded"
+                className="text-[11px] text-amber-600 dark:text-amber-300 font-semibold bg-amber-500/10 border border-amber-500/30 px-2 py-1.5 rounded flex items-start justify-between gap-2"
                 role="status"
               >
-                {weatherWarning}
+                <span className="min-w-0">{weatherWarning}</span>
+                <button
+                  type="button"
+                  onClick={retryWeather}
+                  className="shrink-0 text-[10px] uppercase tracking-wider text-gold-premium underline hover:text-gold-hover cursor-pointer"
+                >
+                  Retry
+                </button>
               </div>
             )}
 
@@ -980,7 +1079,7 @@ export default function App() {
             initial={{ opacity: 0, y: -50, scale: 0.95 }}
             animate={{ opacity: 1, y: 16, scale: 1 }}
             exit={{ opacity: 0, y: -50, scale: 0.95 }}
-            className="fixed top-16 left-1/2 -translate-x-1/2 z-50 max-w-[min(92vw,28rem)] bg-emerald-900 text-white font-medium px-5 py-3 rounded-xl shadow-xl flex items-center gap-2 border border-emerald-800"
+            className="fixed top-28 lg:top-16 left-1/2 -translate-x-1/2 z-50 max-w-[min(92vw,28rem)] bg-emerald-900 text-white font-medium px-5 py-3 rounded-xl shadow-xl flex items-center gap-2 border border-emerald-800"
             id="saved-itinerary-toast"
             role="status"
             aria-live="polite"
@@ -1365,7 +1464,7 @@ export default function App() {
             </div>
 
             <div
-              className="flex-1 overflow-visible max-h-none lg:overflow-y-auto lg:max-h-[640px] space-y-4 py-4"
+              className="flex-1 overflow-visible max-h-none lg:overflow-y-auto lg:max-h-[640px] space-y-4 pt-4 pb-36 lg:pb-4"
               id="itinerary-items-list-container"
             >
               {itinerary.length === 0 ? (
@@ -1416,7 +1515,11 @@ export default function App() {
                 </div>
               ) : (
                 <div className="space-y-4 pr-1">
-                  <DayTimeline groups={dayGroups} conflicts={scheduleConflicts} />
+                  <DayTimeline
+                    groups={dayGroups}
+                    conflicts={scheduleConflicts}
+                    transitGaps={transitGaps}
+                  />
                   <AnimatePresence mode="popLayout">
                     {chronologicalItinerary.map((item) => {
                       const associated = CATALOG_ACTIVITIES.find((a) => a.id === item.activityId);
@@ -1429,6 +1532,7 @@ export default function App() {
                           onRemove={handleRemoveItem}
                           allowLocationSwitch={associated?.location === 'Both'}
                           hasConflict={itemHasConflict(item.id, scheduleConflicts)}
+                          hasTransitGap={itemHasTransitGap(item.id, transitGaps)}
                         />
                       );
                     })}
@@ -1438,7 +1542,7 @@ export default function App() {
             </div>
 
             <div
-              className="pt-4 border-t border-dark-border mt-auto lg:static sticky bottom-0 z-10 -mx-4 sm:-mx-5 px-4 sm:px-5 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-dark-card/95 [-webkit-backdrop-filter:blur(8px)] backdrop-blur-sm"
+              className="pt-4 border-t border-dark-border mt-auto lg:static sticky bottom-0 z-10 px-0 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-dark-card/95 [-webkit-backdrop-filter:blur(8px)] backdrop-blur-sm"
               id="cost-estimator-panel"
             >
               <div className="space-y-2 mb-4">
@@ -1591,6 +1695,13 @@ export default function App() {
                       Note: {scheduleConflicts.length} same-venue schedule conflict
                       {scheduleConflicts.length === 1 ? '' : 's'} detected — review times before
                       confirming with Villa &amp; Vale.
+                    </p>
+                  )}
+                  {transitGaps.length > 0 && (
+                    <p className="text-xs text-sky-800 dark:text-sky-200 font-semibold bg-sky-500/10 border border-sky-500/30 rounded-xl px-3 py-2">
+                      Note: {transitGaps.length} coastal drive
+                      {transitGaps.length === 1 ? '' : 's'} too tight between venues — add buffer
+                      or adjust start times.
                     </p>
                   )}
 

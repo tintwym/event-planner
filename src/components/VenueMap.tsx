@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { MapPin, Navigation, Info, Users, Calendar, Clock, ChevronRight } from 'lucide-react';
 import { ItineraryItem, Venue } from '../types';
 import { VENUES } from '../data/venues';
+import { getTransit } from '../data/transit';
+import { findTransitGaps, getItemWindow, timeToMinutes } from '../lib/schedule';
 
 interface VenueMapProps {
   itinerary: ItineraryItem[];
@@ -10,77 +12,35 @@ interface VenueMapProps {
   onSelectDate: (date: string) => void;
 }
 
-// Distance and travel time lookup matrix between venues
-const TRANSIT_MATRIX: Record<string, Record<string, { distance: string; duration: string }>> = {
-  v1: {
-    v2: { distance: '22 km', duration: '45 mins' },
-    v3: { distance: '31 km', duration: '1 hr' },
-    h1: { distance: '2.5 km', duration: '8 mins' },
-    h2: { distance: '20 km', duration: '40 mins' },
-    h3: { distance: '29 km', duration: '55 mins' },
-  },
-  v2: {
-    v1: { distance: '22 km', duration: '45 mins' },
-    v3: { distance: '16 km', duration: '35 mins' },
-    h1: { distance: '21 km', duration: '40 mins' },
-    h2: { distance: '4 km', duration: '12 mins' },
-    h3: { distance: '15 km', duration: '30 mins' },
-  },
-  v3: {
-    v1: { distance: '31 km', duration: '1 hr' },
-    v2: { distance: '16 km', duration: '35 mins' },
-    h1: { distance: '30 km', duration: '55 mins' },
-    h2: { distance: '15 km', duration: '30 mins' },
-    h3: { distance: '1.2 km', duration: '5 mins' },
-  },
-  h1: {
-    v1: { distance: '2.5 km', duration: '8 mins' },
-    v2: { distance: '21 km', duration: '40 mins' },
-    v3: { distance: '30 km', duration: '55 mins' },
-    h2: { distance: '19 km', duration: '38 mins' },
-    h3: { distance: '28 km', duration: '50 mins' },
-  },
-  h2: {
-    v1: { distance: '20 km', duration: '40 mins' },
-    v2: { distance: '4 km', duration: '12 mins' },
-    v3: { distance: '15 km', duration: '30 mins' },
-    h1: { distance: '19 km', duration: '38 mins' },
-    h3: { distance: '14 km', duration: '28 mins' },
-  },
-  h3: {
-    v1: { distance: '29 km', duration: '55 mins' },
-    v2: { distance: '15 km', duration: '30 mins' },
-    v3: { distance: '1.2 km', duration: '5 mins' },
-    h1: { distance: '28 km', duration: '50 mins' },
-    h2: { distance: '14 km', duration: '28 mins' },
-  },
-};
-
 export default function VenueMap({ itinerary, selectedDate, onSelectDate }: VenueMapProps) {
   const [selectedVenue, setSelectedVenue] = useState<Venue | null>(VENUES[0]);
 
-  // Extract unique dates that have scheduled events for easy filtering
   const scheduledDates = Array.from(new Set(itinerary.map((item) => item.date))).sort();
 
-  // Get chronological events scheduled for the current selected date
   const activeDayEvents = itinerary
     .filter((item) => item.date === selectedDate && item.venueId)
     .sort((a, b) => a.time.localeCompare(b.time));
 
-  // Determine transit routes connecting venues scheduled on this date
-  const routes: Array<{ from: Venue; to: Venue; info: { distance: string; duration: string } }> = [];
+  const dayTransitGaps = findTransitGaps(itinerary.filter((item) => item.date === selectedDate));
+
+  const routes: Array<{
+    from: Venue;
+    to: Venue;
+    info: { distance: string; duration: string; minutes: number };
+    tight: boolean;
+  }> = [];
   for (let i = 0; i < activeDayEvents.length - 1; i++) {
     const fromVenue = VENUES.find((v) => v.id === activeDayEvents[i].venueId);
     const toVenue = VENUES.find((v) => v.id === activeDayEvents[i + 1].venueId);
     if (fromVenue && toVenue && fromVenue.id !== toVenue.id) {
-      const transitInfo = TRANSIT_MATRIX[fromVenue.id]?.[toVenue.id] || {
-        distance: '10 km',
-        duration: '20 mins',
-      };
+      const transitInfo = getTransit(fromVenue.id, toVenue.id);
+      const { end } = getItemWindow(activeDayEvents[i]);
+      const nextStart = timeToMinutes(activeDayEvents[i + 1].time);
       routes.push({
         from: fromVenue,
         to: toVenue,
         info: transitInfo,
+        tight: nextStart - end < transitInfo.minutes,
       });
     }
   }
@@ -281,12 +241,25 @@ export default function VenueMap({ itinerary, selectedDate, onSelectDate }: Venu
           {/* Active Date schedule summary */}
           <div className="bg-[#121214] p-4 rounded-xl border border-dark-border space-y-3">
             <span className="text-[9px] uppercase tracking-wider font-bold text-slate-500">Route Sequence ({selectedDate})</span>
+            {dayTransitGaps.length > 0 && (
+              <p className="text-[10px] font-semibold text-sky-400" role="status">
+                {dayTransitGaps.length} coastal drive{dayTransitGaps.length === 1 ? '' : 's'} too tight for the scheduled windows.
+              </p>
+            )}
             {activeDayEvents.length === 0 ? (
               <p className="text-xs text-slate-400 italic">No events scheduled on this date.</p>
             ) : (
               <div className="space-y-2.5">
                 {activeDayEvents.map((item, idx) => {
                   const venue = VENUES.find((v) => v.id === item.venueId);
+                  const next = activeDayEvents[idx + 1];
+                  const transit =
+                    next && item.venueId && next.venueId && item.venueId !== next.venueId
+                      ? getTransit(item.venueId, next.venueId)
+                      : null;
+                  const tight =
+                    transit &&
+                    dayTransitGaps.some((g) => g.fromId === item.id && g.toId === next.id);
                   return (
                     <div key={item.id} className="space-y-1">
                       <div className="flex items-center gap-2">
@@ -301,17 +274,17 @@ export default function VenueMap({ itinerary, selectedDate, onSelectDate }: Venu
                           <Clock className="w-2.5 h-2.5" /> {item.time}
                         </span>
                       </div>
-                      
-                      {/* Render travel segment information below if there's a next venue */}
-                      {idx < activeDayEvents.length - 1 && activeDayEvents[idx + 1].venueId !== item.venueId && (
-                        <div className="pl-6 border-l border-dashed border-dark-border py-1 flex items-center gap-1.5 text-[9px] font-bold text-amber-500 uppercase">
+
+                      {transit && (
+                        <div
+                          className={`pl-6 border-l border-dashed border-dark-border py-1 flex items-center gap-1.5 text-[9px] font-bold uppercase ${
+                            tight ? 'text-sky-400' : 'text-amber-500'
+                          }`}
+                        >
                           <Navigation className="w-2.5 h-2.5" />
                           <span>
-                            SS163 Drive: {
-                              TRANSIT_MATRIX[item.venueId!]?.[activeDayEvents[idx+1].venueId!]?.duration || '20 mins'
-                            } ({
-                              TRANSIT_MATRIX[item.venueId!]?.[activeDayEvents[idx+1].venueId!]?.distance || '8 km'
-                            })
+                            SS163 Drive: {transit.duration} ({transit.distance})
+                            {tight ? ' · too tight' : ''}
                           </span>
                         </div>
                       )}

@@ -11,6 +11,8 @@ export interface EventActivity {
   pricePerGuest: number;
   /** Soft capacity limit for guest count validation */
   maxGuests: number;
+  /** Planned event length for conflicts, timeline, and calendar export */
+  durationMinutes: number;
   image: string;
   features: string[];
 }
@@ -31,6 +33,8 @@ export interface ItineraryItem {
   pricePerGuest?: number;
   /** Specific historic venue assigned to the event */
   venueId?: string;
+  /** When set, overrides category default duration for schedule / ICS */
+  durationMinutes?: number;
 }
 
 export interface Venue {

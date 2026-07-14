@@ -10,6 +10,7 @@ export interface EventActivity {
   basePrice: number;
   pricePerGuest: number;
   maxGuests: number;
+  durationMinutes: number;
   image: string;
   features: string[];
 }
@@ -28,6 +29,7 @@ export interface ItineraryItem {
   basePrice?: number;
   pricePerGuest?: number;
   venueId?: string;
+  durationMinutes?: number;
 }
 
 export interface Venue {

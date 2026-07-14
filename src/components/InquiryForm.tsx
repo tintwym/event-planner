@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Mail, Send, Copy, CheckCircle } from 'lucide-react';
 import { ItineraryItem } from '../types';
-import { buildInquiryMailto, buildInquiryPackageText } from '../lib/export';
+import { buildInquiryMailto, buildInquiryPackageText, downloadTextFile } from '../lib/export';
 
 interface InquiryFormProps {
   plannerName: string;
@@ -53,13 +53,23 @@ export default function InquiryForm({ plannerName, items, total }: InquiryFormPr
 
     const data = payload();
     const { href, truncated } = buildInquiryMailto(data);
+    const fullText = buildInquiryPackageText(data);
 
     if (truncated) {
       try {
-        await navigator.clipboard.writeText(buildInquiryPackageText(data));
+        await navigator.clipboard.writeText(fullText);
         setHint('Full agenda copied — paste it into the email body.');
       } catch {
-        setHint('Agenda is long; please attach details manually in your email.');
+        downloadTextFile(
+          `${plannerName.replace(/[^\w\-]+/g, '_').slice(0, 40) || 'villa-vale'}-inquiry.txt`,
+          fullText,
+          'text/plain;charset=utf-8'
+        );
+        setError(
+          'Clipboard blocked. Full agenda downloaded as a text file — attach it to your email, then send.'
+        );
+        setHint(null);
+        return;
       }
     }
 

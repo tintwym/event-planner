@@ -27,7 +27,7 @@ export function parseWindKmh(windSpeed: unknown): number | null {
 }
 
 /**
- * Humidity: >60% guest discomfort / floral stress (caution); >75% high for outdoor events.
+ * Humidity: ≥60% guest discomfort / floral stress (caution); ≥75% high for outdoor events.
  * Wind: ≥20 km/h canopy & décor stress (caution); ≥40 km/h high risk for outdoor ceremonies.
  */
 export function evaluateOutdoorWeatherRisks(

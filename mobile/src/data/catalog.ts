@@ -11,6 +11,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 5000,
     pricePerGuest: 85,
     maxGuests: 120,
+    durationMinutes: 180,
     image: 'https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&q=80&w=600',
     features: [
       'Floral arch & complete ceremonial setup',
@@ -29,6 +30,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 4200,
     pricePerGuest: 75,
     maxGuests: 60,
+    durationMinutes: 150,
     image: 'https://images.unsplash.com/photo-1464366400600-7168b8af9bc3?auto=format&fit=crop&q=80&w=600',
     features: [
       'Exclusive private garden glasshouse hire',
@@ -47,6 +49,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 7500,
     pricePerGuest: 120,
     maxGuests: 250,
+    durationMinutes: 300,
     image: 'https://images.unsplash.com/photo-1469371670807-013ccf25f16a?auto=format&fit=crop&q=80&w=600',
     features: [
       'Pre-function cocktail lobby access',
@@ -65,6 +68,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 3500,
     pricePerGuest: 60,
     maxGuests: 80,
+    durationMinutes: 240,
     image: 'https://images.unsplash.com/photo-1511795409834-ef04bbd61622?auto=format&fit=crop&q=80&w=600',
     features: [
       'Villa private courtyard and garden lawns',
@@ -85,6 +89,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 600,
     pricePerGuest: 150,
     maxGuests: 12,
+    durationMinutes: 150,
     image: 'https://images.unsplash.com/photo-1510812431401-41d2bd2722f3?auto=format&fit=crop&q=80&w=600',
     features: [
       'Dedicated private butler service',
@@ -103,6 +108,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 850,
     pricePerGuest: 90,
     maxGuests: 40,
+    durationMinutes: 180,
     image: 'https://images.unsplash.com/photo-1533777857889-4be7c70b33f7?auto=format&fit=crop&q=80&w=600',
     features: [
       'Private master grill chefs preparing food live',
@@ -121,6 +127,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 1200,
     pricePerGuest: 200,
     maxGuests: 14,
+    durationMinutes: 150,
     image: 'https://images.unsplash.com/photo-1506377247377-2a5b3b417ebb?auto=format&fit=crop&q=80&w=600',
     features: [
       'Sommelier-guided flight of 6 rare vintage wines',
@@ -139,6 +146,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 500,
     pricePerGuest: 110,
     maxGuests: 20,
+    durationMinutes: 150,
     image: 'https://images.unsplash.com/photo-1544025162-d76694265947?auto=format&fit=crop&q=80&w=600',
     features: [
       'Custom seasonal menu tailored to dietary preferences',
@@ -159,6 +167,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 150,
     pricePerGuest: 25,
     maxGuests: 16,
+    durationMinutes: 90,
     image: 'https://images.unsplash.com/photo-1544367567-0f2fcb009e0b?auto=format&fit=crop&q=80&w=600',
     features: [
       'Private 90-minute expert-led yoga and meditation session',
@@ -177,6 +186,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 200,
     pricePerGuest: 35,
     maxGuests: 12,
+    durationMinutes: 120,
     image: 'https://images.unsplash.com/photo-1514362545857-3bc16c4c7d1b?auto=format&fit=crop&q=80&w=600',
     features: [
       'Interactive 2-hour hands-on mixology session',
@@ -195,6 +205,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 300,
     pricePerGuest: 95,
     maxGuests: 8,
+    durationMinutes: 120,
     image: 'https://images.unsplash.com/photo-1540555700478-4be289fbecef?auto=format&fit=crop&q=80&w=600',
     features: [
       '60-minute therapeutic massage using custom oil blends',
@@ -213,6 +224,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 1800,
     pricePerGuest: 110,
     maxGuests: 20,
+    durationMinutes: 240,
     image: 'https://images.unsplash.com/photo-1567899378494-47b22a2ae96a?auto=format&fit=crop&q=80&w=600',
     features: [
       '4-hour private catamaran cruise with experienced captain and crew',
@@ -231,6 +243,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 180,
     pricePerGuest: 45,
     maxGuests: 4,
+    durationMinutes: 90,
     image: 'https://images.unsplash.com/photo-1578683010236-d716f9a3f461?auto=format&fit=crop&q=80&w=600',
     features: [
       'Handcrafted floating wicker tray matching pool aesthetics',
@@ -249,6 +262,7 @@ export const CATALOG_ACTIVITIES: EventActivity[] = [
     basePrice: 250,
     pricePerGuest: 15,
     maxGuests: 30,
+    durationMinutes: 150,
     image: 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&q=80&w=600',
     features: [
       'Huge 150-inch professional outdoor projection screen',

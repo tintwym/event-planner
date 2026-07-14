@@ -3,6 +3,11 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
+import {
+  buildWeatherEstimate,
+  mergeWeatherPayload,
+  type WeatherEstimatePayload,
+} from "./src/data/weatherStations";
 
 dotenv.config();
 
@@ -44,78 +49,12 @@ async function startServer() {
     return aiClient;
   }
 
-  /** Approximate micro-station coords for known villa/hotel microclimates */
-  const STATION_FALLBACKS: Record<
-    string,
-    { stationName: string; stationLat: number; stationLng: number; humidity: number; windSpeed: string }
-  > = {
-    "villa cimbrone": {
-      stationName: "Ravello cliff micro-station",
-      stationLat: 40.6473,
-      stationLng: 14.6111,
-      humidity: 68,
-      windSpeed: "18 km/h",
-    },
-    "villa treville": {
-      stationName: "Positano cliffside gauge",
-      stationLat: 40.6277,
-      stationLng: 14.4994,
-      humidity: 72,
-      windSpeed: "22 km/h",
-    },
-    "villa astor": {
-      stationName: "Sorrento terrace station",
-      stationLat: 40.6315,
-      stationLng: 14.3734,
-      humidity: 64,
-      windSpeed: "14 km/h",
-    },
-    "belmond hotel caruso": {
-      stationName: "Caruso terrace AWS",
-      stationLat: 40.6506,
-      stationLng: 14.6128,
-      humidity: 70,
-      windSpeed: "20 km/h",
-    },
-    "le sirenuse": {
-      stationName: "Positano harbour AWS",
-      stationLat: 40.6291,
-      stationLng: 14.4855,
-      humidity: 74,
-      windSpeed: "16 km/h",
-    },
-    "grand hotel excelsior vittoria": {
-      stationName: "Sorrento clifftop AWS",
-      stationLat: 40.6293,
-      stationLng: 14.3752,
-      humidity: 66,
-      windSpeed: "15 km/h",
-    },
-  };
-
-  function getFallbackWeather(location: string) {
-    const key = location.trim().toLowerCase();
-    const matched = Object.entries(STATION_FALLBACKS).find(([name]) => key.includes(name));
-    const station = matched?.[1];
-    return {
-      locationName: `${location} (Estimate)`,
-      stationName: station?.stationName ?? "Nearest regional AWS (estimate)",
-      stationLat: station?.stationLat ?? 40.634,
-      stationLng: station?.stationLng ?? 14.6026,
-      currentTemp: 28,
-      condition: "Sunny",
-      humidity: station?.humidity ?? 65,
-      windSpeed: station?.windSpeed ?? "12 km/h",
-      forecast: [
-        { day: "Tue", temp: 29, condition: "Sunny" },
-        { day: "Wed", temp: 30, condition: "Partly Cloudy" },
-        { day: "Thu", temp: 27, condition: "Sunny" },
-      ],
-    };
+  function getFallbackWeather(location: string): WeatherEstimatePayload {
+    return buildWeatherEstimate(location);
   }
 
   // Avoid burning free-tier quota on every page reload / HMR
-  type WeatherPayload = ReturnType<typeof getFallbackWeather>;
+  type WeatherPayload = WeatherEstimatePayload;
   const weatherCache = new Map<
     string,
     { data: WeatherPayload; cachedAt: number; fallback: boolean }
@@ -201,33 +140,23 @@ async function startServer() {
       if (cached) {
         const ttl = cached.fallback ? WEATHER_FALLBACK_TTL_MS : WEATHER_CACHE_TTL_MS;
         if (now - cached.cachedAt < ttl) {
-          const fallback = getFallbackWeather(location);
-          const data = {
-            ...fallback,
-            ...cached.data,
-            stationName: cached.data.stationName || fallback.stationName,
-            stationLat:
-              typeof cached.data.stationLat === "number"
-                ? cached.data.stationLat
-                : fallback.stationLat,
-            stationLng:
-              typeof cached.data.stationLng === "number"
-                ? cached.data.stationLng
-                : fallback.stationLng,
-          };
+          const data = mergeWeatherPayload(getFallbackWeather(location), cached.data);
+          // Gemini is never live-grounded — always surface as an estimate
           return res.json({
-            success: !cached.fallback,
-            fallback: cached.fallback,
-            error: cached.fallback
-              ? "Live weather unavailable. Showing a cached estimate."
-              : undefined,
+            success: false,
+            fallback: true,
+            error:
+              "Model weather estimate (not a live station feed). Use for planning context only.",
             data,
           });
         }
       }
 
       if (now < weatherQuotaCooldownUntil) {
-        const data = cached?.data ?? getFallbackWeather(location);
+        const data = mergeWeatherPayload(
+          getFallbackWeather(location),
+          cached?.data ?? {}
+        );
         return res.json({
           success: false,
           fallback: true,
@@ -237,7 +166,7 @@ async function startServer() {
       }
 
       const ai = getGemini();
-      const promptText = `Provide a realistic current weather snapshot and 3-day forecast for "${location}". Temperatures in Celsius. Include the nearest realistic automatic weather station (AWS) for micro-climate context: stationName plus precise stationLat and stationLng (decimal degrees near the villa/hotel or town, not a city centroid far inland). Wind as a string with km/h. Return only JSON matching the schema. Use typical seasonal coastal conditions if live data is unavailable.`;
+      const promptText = `Provide a realistic seasonal weather estimate and 3-day outlook for "${location}" (not live observations). Temperatures in Celsius. Include a plausible nearest automatic weather station name plus stationLat/stationLng near the villa/hotel or town. Wind as a string with km/h. Return only JSON matching the schema.`;
 
       // Use Flash-Lite — separate free-tier quota from the exhausted Flash pool
       const response = await ai.models.generateContent({
@@ -250,27 +179,20 @@ async function startServer() {
       });
 
       const textOutput = response.text?.trim() || "{}";
-      const parsedData = JSON.parse(textOutput) as WeatherPayload;
-      const fallback = getFallbackWeather(location);
-      const data: WeatherPayload = {
-        ...fallback,
-        ...parsedData,
-        stationName: parsedData.stationName || fallback.stationName,
-        stationLat:
-          typeof parsedData.stationLat === "number"
-            ? parsedData.stationLat
-            : fallback.stationLat,
-        stationLng:
-          typeof parsedData.stationLng === "number"
-            ? parsedData.stationLng
-            : fallback.stationLng,
-      };
+      const parsedData = JSON.parse(textOutput) as Partial<WeatherPayload>;
+      const data = mergeWeatherPayload(getFallbackWeather(location), parsedData);
       weatherCache.set(cacheKey, {
         data,
         cachedAt: now,
-        fallback: false,
+        fallback: true,
       });
-      res.json({ success: true, fallback: false, data });
+      res.json({
+        success: false,
+        fallback: true,
+        error:
+          "Model weather estimate (not a live station feed). Use for planning context only.",
+        data,
+      });
     } catch (error: any) {
       const message = String(error?.message || error);
       const isQuota =

@@ -1,4 +1,5 @@
 import { EventCategory, ItineraryItem } from '../types';
+import { getTransit } from '../data/transit';
 
 /** Default event length used for overlap detection when duration is not stored */
 export function defaultDurationHours(category: EventCategory): number {
@@ -11,6 +12,22 @@ export function defaultDurationHours(category: EventCategory): number {
     default:
       return 2;
   }
+}
+
+export function defaultDurationMinutes(category: EventCategory): number {
+  return Math.round(defaultDurationHours(category) * 60);
+}
+
+/** Prefer item.durationMinutes, else category default */
+export function getItemDurationMinutes(item: ItineraryItem): number {
+  if (
+    typeof item.durationMinutes === 'number' &&
+    Number.isFinite(item.durationMinutes) &&
+    item.durationMinutes > 0
+  ) {
+    return Math.round(item.durationMinutes);
+  }
+  return defaultDurationMinutes(item.category);
 }
 
 /** Parse "HH:MM" into minutes from midnight */
@@ -34,7 +51,7 @@ export function getItemWindow(item: ItineraryItem): {
   crossesMidnight: boolean;
 } {
   const start = timeToMinutes(item.time);
-  const end = start + Math.round(defaultDurationHours(item.category) * 60);
+  const end = start + getItemDurationMinutes(item);
   return { start, end, crossesMidnight: end >= 24 * 60 };
 }
 
@@ -65,6 +82,17 @@ export interface ScheduleConflict {
   location: string;
 }
 
+export interface TransitGap {
+  fromId: string;
+  toId: string;
+  fromTitle: string;
+  toTitle: string;
+  date: string;
+  travelMinutes: number;
+  availableMinutes: number;
+  travelLabel: string;
+}
+
 type TimedSlot = {
   item: ItineraryItem;
   /** Absolute minutes from a shared epoch for sorting/overlap */
@@ -77,12 +105,13 @@ function dateToEpochDay(isoDate: string): number {
   return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
 }
 
-/** Same-venue overlaps, including overnight spill into the next calendar day */
+/** Same physical venue overlaps (by venueId), including overnight spill */
 export function findConflicts(items: ItineraryItem[]): ScheduleConflict[] {
   const conflicts: ScheduleConflict[] = [];
-  const byLocation = new Map<string, TimedSlot[]>();
+  const byVenue = new Map<string, TimedSlot[]>();
 
   for (const item of items) {
+    if (!item.venueId) continue;
     const day = dateToEpochDay(item.date);
     const { start, end } = getItemWindow(item);
     const slot: TimedSlot = {
@@ -90,12 +119,12 @@ export function findConflicts(items: ItineraryItem[]): ScheduleConflict[] {
       absStart: day * 24 * 60 + start,
       absEnd: day * 24 * 60 + end,
     };
-    const list = byLocation.get(item.location) ?? [];
+    const list = byVenue.get(item.venueId) ?? [];
     list.push(slot);
-    byLocation.set(item.location, list);
+    byVenue.set(item.venueId, list);
   }
 
-  for (const [, group] of byLocation) {
+  for (const [, group] of byVenue) {
     const sorted = [...group].sort(
       (a, b) => a.absStart - b.absStart || a.item.id.localeCompare(b.item.id)
     );
@@ -118,6 +147,55 @@ export function findConflicts(items: ItineraryItem[]): ScheduleConflict[] {
   }
 
   return conflicts;
+}
+
+/** Consecutive same-day venue changes with insufficient drive time */
+export function findTransitGaps(items: ItineraryItem[]): TransitGap[] {
+  const gaps: TransitGap[] = [];
+  const byDate = new Map<string, ItineraryItem[]>();
+
+  for (const item of items) {
+    if (!item.venueId) continue;
+    const list = byDate.get(item.date) ?? [];
+    list.push(item);
+    byDate.set(item.date, list);
+  }
+
+  for (const [date, dayItems] of byDate) {
+    const sorted = [...dayItems].sort(
+      (a, b) =>
+        timeToMinutes(a.time) - timeToMinutes(b.time) || a.id.localeCompare(b.id)
+    );
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const from = sorted[i];
+      const to = sorted[i + 1];
+      if (!from.venueId || !to.venueId || from.venueId === to.venueId) continue;
+      const { end: fromEnd } = getItemWindow(from);
+      const toStart = timeToMinutes(to.time);
+      // If next starts before prior ends, venue conflict already covers same venue;
+      // for travel, measure gap from prior end to next start (may be negative).
+      const available = toStart - fromEnd;
+      const transit = getTransit(from.venueId, to.venueId);
+      if (available < transit.minutes) {
+        gaps.push({
+          fromId: from.id,
+          toId: to.id,
+          fromTitle: from.title,
+          toTitle: to.title,
+          date,
+          travelMinutes: transit.minutes,
+          availableMinutes: available,
+          travelLabel: transit.duration,
+        });
+      }
+    }
+  }
+
+  return gaps;
+}
+
+export function itemHasTransitGap(itemId: string, gaps: TransitGap[]): boolean {
+  return gaps.some((g) => g.fromId === itemId || g.toId === itemId);
 }
 
 export function conflictedItemCount(conflicts: ScheduleConflict[]): number {

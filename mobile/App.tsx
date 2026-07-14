@@ -25,11 +25,14 @@ import { MOCK_PROFILES } from './src/data/profiles';
 import {
   dateToISODate,
   dateToTimeHM,
+  defaultDurationMinutes,
   findConflicts,
+  findTransitGaps,
   formatTimeRange,
   isValidISODate,
   isValidTimeHM,
   itemHasConflict,
+  itemHasTransitGap,
   parseISODateToDate,
   parseTimeToDate,
   sortItineraryChronologically,
@@ -38,6 +41,8 @@ import {
   evaluateOutdoorWeatherRisks,
   formatStationCoordinates,
 } from './src/lib/weatherRisk';
+import { buildWeatherEstimate } from './src/data/weatherStations';
+import { getTransit } from './src/data/transit';
 
 const MAP_VIEWBOX = { w: 800, h: 500 };
 const MOOD_IMAGE_KEY = 'villa_hotel_mood_board_img';
@@ -69,51 +74,6 @@ const getApiUrl = () => {
 
 const createId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
-const TRANSIT_MATRIX: Record<string, Record<string, { distance: string; duration: string }>> = {
-  v1: {
-    v2: { distance: '22 km', duration: '45 mins' },
-    v3: { distance: '31 km', duration: '1 hr' },
-    h1: { distance: '2.5 km', duration: '8 mins' },
-    h2: { distance: '20 km', duration: '40 mins' },
-    h3: { distance: '29 km', duration: '55 mins' },
-  },
-  v2: {
-    v1: { distance: '22 km', duration: '45 mins' },
-    v3: { distance: '16 km', duration: '35 mins' },
-    h1: { distance: '21 km', duration: '40 mins' },
-    h2: { distance: '4 km', duration: '12 mins' },
-    h3: { distance: '15 km', duration: '30 mins' },
-  },
-  v3: {
-    v1: { distance: '31 km', duration: '1 hr' },
-    v2: { distance: '16 km', duration: '35 mins' },
-    h1: { distance: '30 km', duration: '55 mins' },
-    h2: { distance: '15 km', duration: '30 mins' },
-    h3: { distance: '1.2 km', duration: '5 mins' },
-  },
-  h1: {
-    v1: { distance: '2.5 km', duration: '8 mins' },
-    v2: { distance: '21 km', duration: '40 mins' },
-    v3: { distance: '30 km', duration: '55 mins' },
-    h2: { distance: '19 km', duration: '38 mins' },
-    h3: { distance: '28 km', duration: '50 mins' },
-  },
-  h2: {
-    v1: { distance: '20 km', duration: '40 mins' },
-    v2: { distance: '4 km', duration: '12 mins' },
-    v3: { distance: '15 km', duration: '30 mins' },
-    h1: { distance: '19 km', duration: '38 mins' },
-    h3: { distance: '14 km', duration: '28 mins' },
-  },
-  h3: {
-    v1: { distance: '29 km', duration: '55 mins' },
-    v2: { distance: '15 km', duration: '30 mins' },
-    v3: { distance: '1.2 km', duration: '5 mins' },
-    h1: { distance: '28 km', duration: '50 mins' },
-    h2: { distance: '14 km', duration: '28 mins' },
-  },
-};
-
 const todayISO = () => {
   const d = new Date();
   const y = d.getFullYear();
@@ -133,29 +93,44 @@ function isValidItineraryItem(item: unknown): item is ItineraryItem {
     typeof row.guests === 'number' &&
     Number.isFinite(row.guests) &&
     typeof row.date === 'string' &&
+    isValidISODate(row.date) &&
     typeof row.time === 'string' &&
+    isValidTimeHM(row.time) &&
     (row.location === 'Villa' || row.location === 'Hotel') &&
     (row.category === 'Weddings' || row.category === 'Dinners' || row.category === 'Activities')
   );
 }
 
 function repriceItem(item: ItineraryItem): ItineraryItem {
-  if (item.activityId) {
-    const original = CATALOG_ACTIVITIES.find((a) => a.id === item.activityId);
-    if (original) {
-      return {
-        ...item,
-        calculatedPrice: original.basePrice + original.pricePerGuest * item.guests,
-      };
-    }
+  const associated = item.activityId
+    ? CATALOG_ACTIVITIES.find((a) => a.id === item.activityId)
+    : undefined;
+  const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
+  const maxGuests = Math.min(
+    associated?.maxGuests ?? 500,
+    venue?.capacity ?? Number.POSITIVE_INFINITY
+  );
+  const guests = Math.min(maxGuests, Math.max(1, item.guests));
+  let calculatedPrice = item.calculatedPrice;
+  let durationMinutes =
+    typeof item.durationMinutes === 'number' &&
+    Number.isFinite(item.durationMinutes) &&
+    item.durationMinutes > 0
+      ? Math.round(item.durationMinutes)
+      : defaultDurationMinutes(item.category);
+
+  if (associated) {
+    calculatedPrice = associated.basePrice + associated.pricePerGuest * guests;
+    durationMinutes = associated.durationMinutes;
+  } else if (typeof item.basePrice === 'number' && Number.isFinite(item.basePrice)) {
+    const ppg =
+      typeof item.pricePerGuest === 'number' && Number.isFinite(item.pricePerGuest)
+        ? Math.max(0, item.pricePerGuest)
+        : 0;
+    const base = Math.max(0, item.basePrice);
+    calculatedPrice = base + ppg * guests;
   }
-  if (typeof item.basePrice === 'number' && Number.isFinite(item.basePrice)) {
-    const ppg = typeof item.pricePerGuest === 'number' && Number.isFinite(item.pricePerGuest)
-      ? item.pricePerGuest
-      : 0;
-    return { ...item, calculatedPrice: item.basePrice + ppg * item.guests };
-  }
-  return item;
+  return { ...item, guests, calculatedPrice, durationMinutes };
 }
 
 export default function Root() {
@@ -303,20 +278,24 @@ function App() {
     })();
   }, []);
 
-  // Persist + update itinerary with functional setState to avoid stale races
+  // Persist via effect (updater stays pure for concurrent/Strict Mode safety)
   const saveItinerary = (
     updater: ItineraryItem[] | ((prev: ItineraryItem[]) => ItineraryItem[])
   ) => {
     if (isHydrating) return;
-    const userId = currentUser ? currentUser.id : 'guest';
-    setItinerary((prev) => {
-      const next = typeof updater === 'function' ? updater(prev) : updater;
-      AsyncStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(next)).catch((e) =>
-        console.error('Failed to save itinerary', e)
-      );
-      return next;
-    });
+    setItinerary((prev) => (typeof updater === 'function' ? updater(prev) : updater));
   };
+
+  useEffect(() => {
+    if (isHydrating) return;
+    const userId = currentUser ? currentUser.id : 'guest';
+    const timer = setTimeout(() => {
+      AsyncStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(itinerary)).catch(
+        (e) => console.error('Failed to save itinerary', e)
+      );
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [itinerary, currentUser, isHydrating]);
 
   const applyGuestItineraryToUser = async (userId: string) => {
     try {
@@ -340,9 +319,44 @@ function App() {
       const guestName = await AsyncStorage.getItem('villa_hotel_planner_name_guest');
       if (guestName) {
         await AsyncStorage.setItem(`villa_hotel_planner_name_${userId}`, guestName);
+        await AsyncStorage.removeItem('villa_hotel_planner_name_guest');
       }
     } catch (e) {
       console.error('Failed to migrate guest itinerary', e);
+    }
+  };
+
+  const promptGuestMigration = async (user: UserProfile, then: () => void) => {
+    try {
+      const guestRaw = await AsyncStorage.getItem('villa_hotel_itinerary_guest');
+      let guestCount = 0;
+      try {
+        const parsed = guestRaw ? JSON.parse(guestRaw) : [];
+        guestCount = Array.isArray(parsed) ? parsed.length : 0;
+      } catch {
+        guestCount = 0;
+      }
+
+      const finish = async (migrate: boolean) => {
+        if (migrate) await applyGuestItineraryToUser(user.id);
+        then();
+      };
+
+      if (guestCount > 0) {
+        Alert.alert(
+          'Bring guest itinerary?',
+          `You have ${guestCount} guest event(s). Move them onto this account if it is empty?`,
+          [
+            { text: 'Keep separate', style: 'cancel', onPress: () => finish(false) },
+            { text: 'Bring over', onPress: () => finish(true) },
+          ]
+        );
+      } else {
+        await finish(false);
+      }
+    } catch (e) {
+      console.error(e);
+      then();
     }
   };
 
@@ -354,24 +368,7 @@ function App() {
     setWeatherWarning(null);
     const softFallback = (label: string, message: string) => {
       setWeatherWarning(message);
-      const venue = VENUES.find((v) =>
-        label.toLowerCase().includes(v.name.toLowerCase().split(' ').slice(0, 2).join(' '))
-      );
-      setWeatherData({
-        locationName: `${label} (Estimate)`,
-        stationName: venue ? `${venue.name} micro-station` : 'Nearest regional AWS (estimate)',
-        stationLat: venue?.lat ?? 40.634,
-        stationLng: venue?.lng ?? 14.6026,
-        currentTemp: 28,
-        condition: 'Sunny',
-        humidity: 65,
-        windSpeed: '12 km/h',
-        forecast: [
-          { day: 'Tue', temp: 29, condition: 'Sunny' },
-          { day: 'Wed', temp: 30, condition: 'Sunny' },
-          { day: 'Thu', temp: 27, condition: 'Sunny' },
-        ],
-      });
+      setWeatherData(buildWeatherEstimate(label));
     };
     try {
       const res = await fetch(`${getApiUrl()}/api/weather?location=${encodeURIComponent(loc)}`);
@@ -449,6 +446,7 @@ function App() {
       notes: '',
       calculatedPrice: activity.basePrice + activity.pricePerGuest * guests,
       venueId: defaultVenue ? defaultVenue.id : undefined,
+      durationMinutes: activity.durationMinutes,
     };
 
     let added = false;
@@ -483,47 +481,21 @@ function App() {
     saveItinerary((prev) =>
       prev.map((item) => {
         if (item.id !== id) return item;
-        const merged = { ...item, ...updates };
+        let merged = { ...item, ...updates };
         if (updates.location && updates.location !== item.location) {
           const firstMatching = VENUES.find((v) => v.type === updates.location);
           merged.venueId = firstMatching ? firstMatching.id : undefined;
         }
-        if (updates.venueId) {
-          const venue = VENUES.find((v) => v.id === updates.venueId);
-          if (venue && merged.guests > venue.capacity) {
-            Alert.alert(
-              'Over capacity',
-              `${venue.name} holds up to ${venue.capacity} guests. Your party is ${merged.guests}.`
-            );
-          }
-        }
-        if (typeof merged.guests === 'number') {
-          const catalog = merged.activityId
-            ? CATALOG_ACTIVITIES.find((a) => a.id === merged.activityId)
-            : undefined;
-          const maxG = catalog?.maxGuests ?? 500;
-          const nextGuests = Math.min(maxG, Math.max(1, merged.guests));
-          if (nextGuests !== merged.guests) {
-            Alert.alert('Guest limit', `This activity allows up to ${maxG} guests.`);
-          }
-          merged.guests = nextGuests;
+        const beforeGuests = item.guests;
+        merged = repriceItem(merged);
+        if (merged.guests < beforeGuests || (updates.venueId && merged.guests < (updates.guests ?? beforeGuests))) {
           const venue = merged.venueId ? VENUES.find((v) => v.id === merged.venueId) : undefined;
-          if (venue && merged.guests > venue.capacity) {
+          if (venue && beforeGuests > venue.capacity) {
             Alert.alert(
-              'Over capacity',
-              `${venue.name} holds up to ${venue.capacity} guests.`
+              'Guests adjusted',
+              `${venue.name} holds up to ${venue.capacity} guests. Party size set to ${merged.guests}.`
             );
           }
-        }
-
-        const shouldReprice =
-          updates.guests !== undefined ||
-          updates.basePrice !== undefined ||
-          updates.pricePerGuest !== undefined ||
-          updates.activityId !== undefined;
-
-        if (shouldReprice) {
-          return repriceItem(merged);
         }
         return merged;
       })
@@ -542,9 +514,20 @@ function App() {
       return;
     }
 
-    const base = parseFloat(customBasePrice) || 0;
-    const ppg = parseFloat(customPricePerGuest) || 0;
-    const guestsNum = Math.max(1, parseInt(customGuests, 10) || 1);
+    const base = parseFloat(customBasePrice);
+    const ppg = parseFloat(customPricePerGuest);
+    if (!Number.isFinite(base) || base < 0 || !Number.isFinite(ppg) || ppg < 0) {
+      Alert.alert('Invalid price', 'Base and per-guest prices must be finite numbers ≥ 0.');
+      return;
+    }
+    if (base > 1_000_000 || ppg > 1_000_000) {
+      Alert.alert('Invalid price', 'Prices look unrealistically high. Please check the amounts.');
+      return;
+    }
+
+    const venue = customVenueId ? VENUES.find((v) => v.id === customVenueId) : undefined;
+    let guestsNum = Math.max(1, parseInt(customGuests, 10) || 1);
+    if (venue) guestsNum = Math.min(guestsNum, venue.capacity);
 
     const newItem: ItineraryItem = {
       id: createId('itinerary-custom'),
@@ -559,6 +542,7 @@ function App() {
       pricePerGuest: ppg,
       calculatedPrice: base + ppg * guestsNum,
       venueId: customVenueId || undefined,
+      durationMinutes: defaultDurationMinutes(customCategory),
     };
 
     saveItinerary((prev) => [...prev, newItem]);
@@ -599,6 +583,7 @@ function App() {
   const totalCost = itinerary.reduce((sum, item) => sum + item.calculatedPrice, 0);
   const peakGuests = itinerary.reduce((max, item) => Math.max(max, item.guests), 0);
   const conflicts = useMemo(() => findConflicts(itinerary), [itinerary]);
+  const transitGaps = useMemo(() => findTransitGaps(itinerary), [itinerary]);
   const chronologicalItinerary = useMemo(
     () => sortItineraryChronologically(itinerary),
     [itinerary]
@@ -670,35 +655,12 @@ function App() {
     }
 
     if (found) {
-      const guestRaw = await AsyncStorage.getItem('villa_hotel_itinerary_guest');
-      let guestCount = 0;
-      try {
-        const parsed = guestRaw ? JSON.parse(guestRaw) : [];
-        guestCount = Array.isArray(parsed) ? parsed.length : 0;
-      } catch {
-        guestCount = 0;
-      }
-
-      const finishLogin = async (migrate: boolean) => {
-        if (migrate) await applyGuestItineraryToUser(found.id);
+      await promptGuestMigration(found, () => {
         setCurrentUser(found);
         setShowLoginModal(false);
         setMobileEmail('');
         setMobilePassword('');
-      };
-
-      if (guestCount > 0) {
-        Alert.alert(
-          'Bring guest itinerary?',
-          `You have ${guestCount} guest event(s). Move them onto this account if it is empty?`,
-          [
-            { text: 'Keep separate', style: 'cancel', onPress: () => finishLogin(false) },
-            { text: 'Bring over', onPress: () => finishLogin(true) },
-          ]
-        );
-      } else {
-        await finishLogin(false);
-      }
+      });
     } else {
       setMobileErrors({
         email: 'This email is not registered. Please sign up using the Register tab or choose a Quick-Login profile below.',
@@ -763,10 +725,12 @@ function App() {
     try {
       customProfiles.push(newProfile);
       await AsyncStorage.setItem('villa_hotel_custom_profiles', JSON.stringify(customProfiles));
-      setCurrentUser(newProfile);
-      setShowLoginModal(false);
-      setRegName('');
-      setRegEmail('');
+      await promptGuestMigration(newProfile, () => {
+        setCurrentUser(newProfile);
+        setShowLoginModal(false);
+        setRegName('');
+        setRegEmail('');
+      });
     } catch (err) {
       console.error(err);
       Alert.alert('Error', 'Failed to save new profile. Please try again.');
@@ -1018,6 +982,14 @@ function App() {
                 </Text>
               </View>
             )}
+            {transitGaps.length > 0 && (
+              <View style={[styles.conflictBanner, { borderColor: '#38bdf8' }]}>
+                <Ionicons name="car-outline" size={16} color="#38bdf8" />
+                <Text style={[styles.conflictBannerText, { color: '#7dd3fc' }]}>
+                  {transitGaps.length} coastal drive{transitGaps.length === 1 ? '' : 's'} too tight
+                </Text>
+              </View>
+            )}
 
             <ScrollView contentContainerStyle={styles.scrollList} keyboardShouldPersistTaps="handled">
               {chronologicalItinerary.length === 0 ? (
@@ -1029,6 +1001,7 @@ function App() {
               ) : (
                 chronologicalItinerary.map(item => {
                   const hasConflict = itemHasConflict(item.id, conflicts);
+                  const hasTransitGap = itemHasTransitGap(item.id, transitGaps);
                   const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
                   const overCapacity = venue ? item.guests > venue.capacity : false;
                   return (
@@ -1036,7 +1009,7 @@ function App() {
                     key={item.id}
                     style={[
                       styles.itineraryCard,
-                      hasConflict && styles.itineraryCardConflict,
+                      (hasConflict || hasTransitGap) && styles.itineraryCardConflict,
                     ]}
                   >
                     <View style={styles.itineraryCardHeader}>
@@ -1047,6 +1020,9 @@ function App() {
                         </Text>
                         {hasConflict && (
                           <Text style={styles.conflictChip}>Overlaps another event here</Text>
+                        )}
+                        {hasTransitGap && (
+                          <Text style={styles.conflictChip}>Coastal drive too short</Text>
                         )}
                         {overCapacity && venue && (
                           <Text style={styles.conflictChip}>
@@ -1348,7 +1324,14 @@ function App() {
                     const venue = VENUES.find((v) => v.id === item.venueId);
                     const nextItem = arr[idx + 1];
                     const nextVenue = nextItem ? VENUES.find((v) => v.id === nextItem.venueId) : null;
-                    const transitInfo = nextVenue && venue ? (TRANSIT_MATRIX[venue.id]?.[nextVenue.id] || { distance: '10 km', duration: '20 mins' }) : null;
+                    const transitInfo =
+                      nextVenue && venue ? getTransit(venue.id, nextVenue.id) : null;
+                    const tight =
+                      Boolean(
+                        transitInfo &&
+                          nextItem &&
+                          transitGaps.some((g) => g.fromId === item.id && g.toId === nextItem.id)
+                      );
 
                     return (
                       <View key={item.id} style={{ marginBottom: 12 }}>
@@ -1364,9 +1347,15 @@ function App() {
                         </View>
                         {transitInfo && (
                           <View style={styles.transitRow}>
-                            <Ionicons name="car" size={14} color="#f59e0b" style={{ marginRight: 6 }} />
-                            <Text style={styles.transitText}>
+                            <Ionicons
+                              name="car"
+                              size={14}
+                              color={tight ? '#38bdf8' : '#f59e0b'}
+                              style={{ marginRight: 6 }}
+                            />
+                            <Text style={[styles.transitText, tight && { color: '#7dd3fc' }]}>
                               Amalfi Coastal Drive: {transitInfo.duration} ({transitInfo.distance})
+                              {tight ? ' · too tight' : ''}
                             </Text>
                           </View>
                         )}
@@ -2080,10 +2069,12 @@ function App() {
                   marginBottom: 8,
                 }}
                 onPress={() => {
-                  setCurrentUser(p);
-                  setShowLoginModal(false);
-                  setMobileEmail('');
-                  setMobilePassword('');
+                  promptGuestMigration(p, () => {
+                    setCurrentUser(p);
+                    setShowLoginModal(false);
+                    setMobileEmail('');
+                    setMobilePassword('');
+                  });
                 }}
               >
                 <Image source={{ uri: p.avatar }} style={{ width: 28, height: 28, borderRadius: 14, marginRight: 10 }} />

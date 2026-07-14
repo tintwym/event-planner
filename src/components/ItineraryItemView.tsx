@@ -22,6 +22,7 @@ interface ItineraryItemViewProps {
   onRemove: (id: string) => void;
   allowLocationSwitch?: boolean;
   hasConflict?: boolean;
+  hasTransitGap?: boolean;
   key?: string | number;
 }
 
@@ -40,8 +41,14 @@ export default function ItineraryItemView({
   onRemove,
   allowLocationSwitch = false,
   hasConflict = false,
+  hasTransitGap = false,
 }: ItineraryItemViewProps) {
-  const maxGuests = associatedActivity?.maxGuests ?? 500;
+  const selectedVenue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
+  const maxGuests = Math.min(
+    associatedActivity?.maxGuests ?? 500,
+    selectedVenue?.capacity ?? Number.POSITIVE_INFINITY
+  );
+  const overCapacity = Boolean(selectedVenue && item.guests > selectedVenue.capacity);
   const today = localTodayISO();
   const minDate = item.date < today ? item.date : today;
 
@@ -70,7 +77,9 @@ export default function ItineraryItemView({
       exit={{ opacity: 0, x: -20 }}
       transition={{ type: 'spring', stiffness: 350, damping: 25 }}
       className={`bg-dark-card border rounded-xl p-4 shadow-md relative ${
-        hasConflict ? 'border-amber-500/50' : 'border-dark-border'
+        hasConflict || hasTransitGap || overCapacity
+          ? 'border-amber-500/50'
+          : 'border-dark-border'
       }`}
       id={`itinerary-item-${item.id}`}
     >
@@ -89,6 +98,20 @@ export default function ItineraryItemView({
         {hasConflict && (
           <span className="inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/30">
             <AlertTriangle className="w-3 h-3" aria-hidden="true" /> Schedule conflict
+          </span>
+        )}
+        {hasTransitGap && (
+          <span className="inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-sky-500/10 text-sky-700 dark:text-sky-300 border border-sky-500/30">
+            <AlertTriangle className="w-3 h-3" aria-hidden="true" /> Tight transit
+          </span>
+        )}
+        {overCapacity && selectedVenue && (
+          <span
+            className="inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-rose-500/10 text-rose-700 dark:text-rose-300 border border-rose-500/30"
+            title={`${selectedVenue.name} holds up to ${selectedVenue.capacity} guests`}
+          >
+            <AlertTriangle className="w-3 h-3" aria-hidden="true" /> Over capacity (
+            {selectedVenue.capacity})
           </span>
         )}
         <span
@@ -206,7 +229,7 @@ export default function ItineraryItemView({
         </label>
         <select
           value={item.venueId || ''}
-          onChange={(e) => pushUpdate({ venueId: e.target.value })}
+          onChange={(e) => pushUpdate({ venueId: e.target.value || undefined })}
           className="w-full px-2.5 py-1.5 bg-dark-input border border-dark-border rounded-lg text-xs text-dark-text-primary font-medium focus:outline-none focus:ring-1 focus:ring-gold-premium focus:border-gold-premium cursor-pointer"
           id={`itinerary-venue-input-${item.id}`}
         >
@@ -217,6 +240,12 @@ export default function ItineraryItemView({
             </option>
           ))}
         </select>
+        {overCapacity && selectedVenue && (
+          <p className="mt-1.5 text-[11px] font-semibold text-rose-600 dark:text-rose-300" role="status">
+            {selectedVenue.name} holds up to {selectedVenue.capacity} guests. Your party is{' '}
+            {item.guests}.
+          </p>
+        )}
       </div>
 
       <div className="mb-4">

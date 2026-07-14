@@ -1,17 +1,25 @@
 import { ItineraryItem } from '../types';
+import { VENUES } from '../data/venues';
 import {
   addDaysISO,
-  defaultDurationHours,
   formatDisplayDate,
+  getItemDurationMinutes,
   getItemWindow,
   timeToMinutes,
 } from './schedule';
+
+const ICS_TZID = 'Europe/Rome';
+
+function venueLabel(item: ItineraryItem): string {
+  const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
+  return venue ? `${venue.name} (${item.location})` : item.location;
+}
 
 function pad(n: number): string {
   return String(n).padStart(2, '0');
 }
 
-/** Local wall time → ICS floating local datetime YYYYMMDDTHHMMSS */
+/** Local wall time in Europe/Rome floating form YYYYMMDDTHHMMSS (paired with TZID) */
 function toIcsLocal(date: string, minutesFromMidnight: number): string {
   const dayOffset = Math.floor(minutesFromMidnight / (24 * 60));
   const mins = ((minutesFromMidnight % (24 * 60)) + 24 * 60) % (24 * 60);
@@ -30,17 +38,58 @@ function escapeIcsText(text: string): string {
     .replace(/\n/g, '\\n');
 }
 
+/** RFC 5545 fold on UTF-8 octets without splitting code points */
 function foldIcsLine(line: string): string {
-  if (line.length <= 75) return line;
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const bytes = encoder.encode(line);
+  if (bytes.length <= 75) return line;
+
   const parts: string[] = [];
-  let rest = line;
-  parts.push(rest.slice(0, 75));
-  rest = rest.slice(75);
-  while (rest.length) {
-    parts.push(` ${rest.slice(0, 74)}`);
-    rest = rest.slice(74);
+  let offset = 0;
+  let first = true;
+  while (offset < bytes.length) {
+    const budget = first ? 75 : 74;
+    let end = Math.min(offset + budget, bytes.length);
+    if (end < bytes.length) {
+      while (end > offset && (bytes[end] & 0xc0) === 0x80) end--;
+      if (end > offset && bytes[end] >= 0xc0) {
+        // ending on a lead byte with incomplete trail — exclude the lead
+        end--;
+        while (end > offset && (bytes[end] & 0xc0) === 0x80) end--;
+      }
+    }
+    if (end <= offset) end = Math.min(offset + 1, bytes.length);
+    const chunk = decoder.decode(bytes.subarray(offset, end));
+    parts.push(first ? chunk : ` ${chunk}`);
+    offset = end;
+    first = false;
   }
   return parts.join('\r\n');
+}
+
+/** Minimal Europe/Rome VTIMEZONE (CET / CEST) for calendar clients */
+function europeRomeVTimezone(): string[] {
+  return [
+    'BEGIN:VTIMEZONE',
+    `TZID:${ICS_TZID}`,
+    'X-LIC-LOCATION:Europe/Rome',
+    'BEGIN:DAYLIGHT',
+    'TZOFFSETFROM:+0100',
+    'TZOFFSETTO:+0200',
+    'TZNAME:CEST',
+    'DTSTART:19700329T020000',
+    'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+    'END:DAYLIGHT',
+    'BEGIN:STANDARD',
+    'TZOFFSETFROM:+0200',
+    'TZOFFSETTO:+0100',
+    'TZNAME:CET',
+    'DTSTART:19701025T030000',
+    'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+    'END:STANDARD',
+    'END:VTIMEZONE',
+  ];
 }
 
 export function buildIcsCalendar(plannerName: string, items: ItineraryItem[]): string {
@@ -54,13 +103,15 @@ export function buildIcsCalendar(plannerName: string, items: ItineraryItem[]): s
     'CALSCALE:GREGORIAN',
     'METHOD:PUBLISH',
     `X-WR-CALNAME:${escapeIcsText(plannerName)}`,
+    `X-WR-TIMEZONE:${ICS_TZID}`,
+    ...europeRomeVTimezone(),
   ];
 
   for (const item of items) {
     const { start, end } = getItemWindow(item);
     const descriptionParts = [
       `Category: ${item.category}`,
-      `Venue: ${item.location}`,
+      `Venue: ${venueLabel(item)}`,
       `Guests: ${item.guests}`,
       `Estimate: $${item.calculatedPrice.toLocaleString()}`,
     ];
@@ -69,10 +120,10 @@ export function buildIcsCalendar(plannerName: string, items: ItineraryItem[]): s
     lines.push('BEGIN:VEVENT');
     lines.push(`UID:${item.id}@villa-vale`);
     lines.push(`DTSTAMP:${dtStamp}`);
-    lines.push(`DTSTART:${toIcsLocal(item.date, start)}`);
-    lines.push(`DTEND:${toIcsLocal(item.date, end)}`);
+    lines.push(`DTSTART;TZID=${ICS_TZID}:${toIcsLocal(item.date, start)}`);
+    lines.push(`DTEND;TZID=${ICS_TZID}:${toIcsLocal(item.date, end)}`);
     lines.push(`SUMMARY:${escapeIcsText(item.title)}`);
-    lines.push(`LOCATION:${escapeIcsText(`${item.location} — Villa & Vale`)}`);
+    lines.push(`LOCATION:${escapeIcsText(`${venueLabel(item)} — Villa & Vale, Amalfi Coast`)}`);
     lines.push(`DESCRIPTION:${escapeIcsText(descriptionParts.join('\n'))}`);
     lines.push('END:VEVENT');
   }
@@ -112,14 +163,16 @@ export function buildAgendaPlainText(plannerName: string, items: ItineraryItem[]
     'Villa & Vale — Event Agenda',
     plannerName,
     `Generated: ${new Date().toLocaleString()}`,
+    `Timezone: ${ICS_TZID}`,
     `Estimated total: $${total.toLocaleString()}`,
     '',
   ];
 
   for (const item of sorted) {
-    const hours = defaultDurationHours(item.category);
-    lines.push(`${formatDisplayDate(item.date)} · ${item.time} (~${hours}h)`);
-    lines.push(`${item.title} @ ${item.location}`);
+    const mins = getItemDurationMinutes(item);
+    const hoursLabel = mins % 60 === 0 ? `${mins / 60}h` : `${(mins / 60).toFixed(1)}h`;
+    lines.push(`${formatDisplayDate(item.date)} · ${item.time} (~${hoursLabel})`);
+    lines.push(`${item.title} @ ${venueLabel(item)}`);
     lines.push(`${item.category} · ${item.guests} guests · $${item.calculatedPrice.toLocaleString()}`);
     if (item.notes.trim()) lines.push(`Notes: ${item.notes.trim()}`);
     lines.push('');
