@@ -1,0 +1,98 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+/* Map Tailwind dark: utilities to our explicit theme class */
+@custom-variant dark (&:where(.dark-mode, .dark-mode *));
+
+:root {
+  --color-gold-premium: #C5A267;
+  --color-gold-hover: #B59257;
+
+  --bg-primary: #FAF9F6;
+  --bg-card: #FFFFFF;
+  --bg-input: #F3F1EC;
+  --border-color: #EAE5DB;
+  --text-primary: #1C1A17;
+  --text-secondary: #5C564E;
+  --text-tertiary: #8C8275;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light-mode):not(.dark-mode) {
+    --bg-primary: #0A0A0A;
+    --bg-card: #161616;
+    --bg-input: #0D0D0D;
+    --border-color: #1F1F1F;
+    --text-primary: #E0E0E0;
+    --text-secondary: #94A3B8;
+    --text-tertiary: #64748B;
+  }
+}
+
+:root.light-mode {
+  --bg-primary: #FAF9F6;
+  --bg-card: #FFFFFF;
+  --bg-input: #F3F1EC;
+  --border-color: #EAE5DB;
+  --text-primary: #1C1A17;
+  --text-secondary: #5C564E;
+  --text-tertiary: #8C8275;
+}
+
+:root.dark-mode {
+  --bg-primary: #0A0A0A;
+  --bg-card: #161616;
+  --bg-input: #0D0D0D;
+  --border-color: #1F1F1F;
+  --text-primary: #E0E0E0;
+  --text-secondary: #94A3B8;
+  --text-tertiary: #64748B;
+}
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Playfair Display", ui-serif, Georgia, Cambria, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-gold-premium: var(--color-gold-premium);
+  --color-gold-hover: var(--color-gold-hover);
+
+  --color-dark-bg: var(--bg-primary);
+  --color-dark-card: var(--bg-card);
+  --color-dark-input: var(--bg-input);
+  --color-dark-border: var(--border-color);
+
+  --color-dark-text-primary: var(--text-primary);
+  --color-dark-text-secondary: var(--text-secondary);
+  --color-dark-text-tertiary: var(--text-tertiary);
+}
+
+@import "./print.css";
+
+/* Respect OS / browser reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-pulse,
+  .animate-spin {
+    animation: none !important;
+  }
+}
+

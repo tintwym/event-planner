@@ -1,0 +1,6 @@
+{
+  "name": "Villa & Vale Event Planner",
+  "description": "An interactive event planning application to browse, coordinate, and schedule Wedding, Dinner, and recreation activities at private Villas and luxury Hotels.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

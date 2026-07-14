@@ -1,0 +1,53 @@
+/* Print: only the agenda summary — keep ancestors visible so #print-area can render */
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+
+  #print-area,
+  #print-area * {
+    visibility: visible !important;
+  }
+
+  #summary-modal-backdrop {
+    position: static !important;
+    inset: auto !important;
+    display: block !important;
+    background: transparent !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  #summary-modal-content {
+    max-height: none !important;
+    width: 100% !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    overflow: visible !important;
+  }
+
+  #print-area {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    background: white !important;
+    color: black !important;
+    padding: 24px !important;
+  }
+
+  #brand-header,
+  #hero-banner-section,
+  #hero-secondary-strip,
+  #primary-grid-workspace,
+  #main-footer,
+  #summary-modal-chrome-header,
+  #summary-modal-chrome-footer {
+    display: none !important;
+  }
+}
