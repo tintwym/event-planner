@@ -1,5 +1,9 @@
-import { ItineraryItem } from '../types';
+import { ItineraryItem, StayItem, TransferItem } from '../types';
 import { VENUES } from '../data/venues';
+import { getRoomType } from '../data/stays';
+import { getTransferMode } from '../data/transfers';
+import { getTransit } from '../data/transit';
+import { stayLineTotal, transferLineTotal } from './pricing';
 import {
   addDaysISO,
   formatDisplayDate,
@@ -13,6 +17,15 @@ const ICS_TZID = 'Europe/Rome';
 function venueLabel(item: ItineraryItem): string {
   const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
   return venue ? `${venue.name} (${item.location})` : item.location;
+}
+
+function venueNameById(venueId: string): string {
+  return VENUES.find((v) => v.id === venueId)?.name ?? venueId;
+}
+
+/** YYYY-MM-DD → YYYYMMDD for ICS DATE values */
+function icsDateValue(isoDate: string): string {
+  return isoDate.replace(/-/g, '');
 }
 
 function pad(n: number): string {
@@ -92,7 +105,12 @@ function europeRomeVTimezone(): string[] {
   ];
 }
 
-export function buildIcsCalendar(plannerName: string, items: ItineraryItem[]): string {
+export function buildIcsCalendar(
+  plannerName: string,
+  items: ItineraryItem[],
+  stays: StayItem[] = [],
+  transfers: TransferItem[] = []
+): string {
   const stamp = new Date();
   const dtStamp = `${stamp.getUTCFullYear()}${pad(stamp.getUTCMonth() + 1)}${pad(stamp.getUTCDate())}T${pad(stamp.getUTCHours())}${pad(stamp.getUTCMinutes())}${pad(stamp.getUTCSeconds())}Z`;
 
@@ -109,8 +127,9 @@ export function buildIcsCalendar(plannerName: string, items: ItineraryItem[]): s
 
   for (const item of items) {
     const { start, end } = getItemWindow(item);
+    const kindLabel = item.kind === 'experience' ? 'Experience' : 'Event';
     const descriptionParts = [
-      `Category: ${item.category}`,
+      `Type: ${kindLabel} — ${item.category}`,
       `Venue: ${venueLabel(item)}`,
       `Guests: ${item.guests}`,
       `Estimate: $${item.calculatedPrice.toLocaleString()}`,
@@ -124,6 +143,59 @@ export function buildIcsCalendar(plannerName: string, items: ItineraryItem[]): s
     lines.push(`DTEND;TZID=${ICS_TZID}:${toIcsLocal(item.date, end)}`);
     lines.push(`SUMMARY:${escapeIcsText(item.title)}`);
     lines.push(`LOCATION:${escapeIcsText(`${venueLabel(item)} — Villa & Vale, Amalfi Coast`)}`);
+    lines.push(`DESCRIPTION:${escapeIcsText(descriptionParts.join('\n'))}`);
+    lines.push('END:VEVENT');
+  }
+
+  for (const stay of stays) {
+    const roomType = getRoomType(stay.roomTypeId);
+    const venueName = venueNameById(stay.venueId);
+    const nights = Math.max(1, Math.round(stay.nights || 1));
+    const rooms = Math.max(1, Math.round(stay.rooms || 1));
+    const checkOut = addDaysISO(stay.checkIn, nights);
+    const descriptionParts = [
+      `Stay: ${venueName}`,
+      `Room: ${roomType?.name ?? stay.roomTypeId} × ${rooms}`,
+      `Nights: ${nights} (check-out ${checkOut})`,
+      `Guests: ${stay.guests}`,
+      `Estimate: $${stayLineTotal(stay).toLocaleString()}`,
+    ];
+    if (stay.notes?.trim()) descriptionParts.push(`Notes: ${stay.notes.trim()}`);
+
+    lines.push('BEGIN:VEVENT');
+    lines.push(`UID:${stay.id}@villa-vale`);
+    lines.push(`DTSTAMP:${dtStamp}`);
+    lines.push(`DTSTART;VALUE=DATE:${icsDateValue(stay.checkIn)}`);
+    lines.push(`DTEND;VALUE=DATE:${icsDateValue(checkOut)}`);
+    lines.push(`SUMMARY:${escapeIcsText(`Stay · ${roomType?.name ?? 'Room'} at ${venueName}`)}`);
+    lines.push(`LOCATION:${escapeIcsText(`${venueName} — Villa & Vale, Amalfi Coast`)}`);
+    lines.push(`DESCRIPTION:${escapeIcsText(descriptionParts.join('\n'))}`);
+    lines.push('END:VEVENT');
+  }
+
+  for (const transfer of transfers) {
+    const modeInfo = getTransferMode(transfer.mode);
+    const transit = getTransit(transfer.fromVenueId, transfer.toVenueId);
+    const fromName = venueNameById(transfer.fromVenueId);
+    const toName = venueNameById(transfer.toVenueId);
+    const start = timeToMinutes(transfer.time);
+    const end = start + transit.minutes;
+    const descriptionParts = [
+      `Transfer: ${fromName} → ${toName}`,
+      `Mode: ${modeInfo.label}`,
+      `Drive: ${transit.duration} (${transit.distance})`,
+      `Passengers: ${transfer.pax}`,
+      `Estimate: $${transferLineTotal(transfer).toLocaleString()}`,
+    ];
+    if (transfer.notes?.trim()) descriptionParts.push(`Notes: ${transfer.notes.trim()}`);
+
+    lines.push('BEGIN:VEVENT');
+    lines.push(`UID:${transfer.id}@villa-vale`);
+    lines.push(`DTSTAMP:${dtStamp}`);
+    lines.push(`DTSTART;TZID=${ICS_TZID}:${toIcsLocal(transfer.date, start)}`);
+    lines.push(`DTEND;TZID=${ICS_TZID}:${toIcsLocal(transfer.date, end)}`);
+    lines.push(`SUMMARY:${escapeIcsText(`Transfer · ${fromName} → ${toName} (${modeInfo.label})`)}`);
+    lines.push(`LOCATION:${escapeIcsText(`${fromName} → ${toName} — Amalfi Coast`)}`);
     lines.push(`DESCRIPTION:${escapeIcsText(descriptionParts.join('\n'))}`);
     lines.push('END:VEVENT');
   }
@@ -145,22 +217,36 @@ export function downloadTextFile(filename: string, content: string, mime: string
   URL.revokeObjectURL(url);
 }
 
-export function downloadIcs(plannerName: string, items: ItineraryItem[]) {
+export function downloadIcs(
+  plannerName: string,
+  items: ItineraryItem[],
+  stays: StayItem[] = [],
+  transfers: TransferItem[] = []
+) {
   const safeName = plannerName.replace(/[^\w\-]+/g, '_').slice(0, 40) || 'villa-vale-agenda';
-  const ics = buildIcsCalendar(plannerName, items);
+  const ics = buildIcsCalendar(plannerName, items, stays, transfers);
   downloadTextFile(`${safeName}.ics`, ics, 'text/calendar;charset=utf-8');
 }
 
-export function buildAgendaPlainText(plannerName: string, items: ItineraryItem[]): string {
+export function buildAgendaPlainText(
+  plannerName: string,
+  items: ItineraryItem[],
+  stays: StayItem[] = [],
+  transfers: TransferItem[] = []
+): string {
   const sorted = [...items].sort((a, b) => {
     const d = a.date.localeCompare(b.date);
     if (d !== 0) return d;
     return timeToMinutes(a.time) - timeToMinutes(b.time);
   });
 
-  const total = sorted.reduce((sum, i) => sum + i.calculatedPrice, 0);
+  const eventsTotal = sorted.reduce((sum, i) => sum + i.calculatedPrice, 0);
+  const staysTotal = stays.reduce((sum, s) => sum + stayLineTotal(s), 0);
+  const transfersTotal = transfers.reduce((sum, t) => sum + transferLineTotal(t), 0);
+  const total = eventsTotal + staysTotal + transfersTotal;
+
   const lines: string[] = [
-    'Villa & Vale — Event Agenda',
+    'Villa & Vale — Package Agenda',
     plannerName,
     `Generated: ${new Date().toLocaleString()}`,
     `Timezone: ${ICS_TZID}`,
@@ -168,14 +254,52 @@ export function buildAgendaPlainText(plannerName: string, items: ItineraryItem[]
     '',
   ];
 
-  for (const item of sorted) {
-    const mins = getItemDurationMinutes(item);
-    const hoursLabel = mins % 60 === 0 ? `${mins / 60}h` : `${(mins / 60).toFixed(1)}h`;
-    lines.push(`${formatDisplayDate(item.date)} · ${item.time} (~${hoursLabel})`);
-    lines.push(`${item.title} @ ${venueLabel(item)}`);
-    lines.push(`${item.category} · ${item.guests} guests · $${item.calculatedPrice.toLocaleString()}`);
-    if (item.notes.trim()) lines.push(`Notes: ${item.notes.trim()}`);
-    lines.push('');
+  if (sorted.length > 0) {
+    lines.push('— Events & Experiences —');
+    for (const item of sorted) {
+      const mins = getItemDurationMinutes(item);
+      const hoursLabel = mins % 60 === 0 ? `${mins / 60}h` : `${(mins / 60).toFixed(1)}h`;
+      const kindLabel = item.kind === 'experience' ? 'Experience' : item.category;
+      lines.push(`${formatDisplayDate(item.date)} · ${item.time} (~${hoursLabel})`);
+      lines.push(`${item.title} @ ${venueLabel(item)}`);
+      lines.push(`${kindLabel} · ${item.guests} guests · $${item.calculatedPrice.toLocaleString()}`);
+      if (item.notes.trim()) lines.push(`Notes: ${item.notes.trim()}`);
+      lines.push('');
+    }
+  }
+
+  if (stays.length > 0) {
+    lines.push('— Stays —');
+    const sortedStays = [...stays].sort((a, b) => a.checkIn.localeCompare(b.checkIn));
+    for (const stay of sortedStays) {
+      const roomType = getRoomType(stay.roomTypeId);
+      const nights = Math.max(1, Math.round(stay.nights || 1));
+      const rooms = Math.max(1, Math.round(stay.rooms || 1));
+      const checkOut = addDaysISO(stay.checkIn, nights);
+      lines.push(`${formatDisplayDate(stay.checkIn)} → ${formatDisplayDate(checkOut)} (${nights} night${nights === 1 ? '' : 's'})`);
+      lines.push(`${roomType?.name ?? 'Room'} × ${rooms} @ ${venueNameById(stay.venueId)}`);
+      lines.push(`${stay.guests} guests · $${stayLineTotal(stay).toLocaleString()}`);
+      if (stay.notes?.trim()) lines.push(`Notes: ${stay.notes.trim()}`);
+      lines.push('');
+    }
+  }
+
+  if (transfers.length > 0) {
+    lines.push('— Transfers —');
+    const sortedTransfers = [...transfers].sort((a, b) => {
+      const d = a.date.localeCompare(b.date);
+      if (d !== 0) return d;
+      return timeToMinutes(a.time) - timeToMinutes(b.time);
+    });
+    for (const transfer of sortedTransfers) {
+      const modeInfo = getTransferMode(transfer.mode);
+      const transit = getTransit(transfer.fromVenueId, transfer.toVenueId);
+      lines.push(`${formatDisplayDate(transfer.date)} · ${transfer.time}`);
+      lines.push(`${venueNameById(transfer.fromVenueId)} → ${venueNameById(transfer.toVenueId)} (${modeInfo.label})`);
+      lines.push(`${transit.duration} · ${transfer.pax} pax · $${transferLineTotal(transfer).toLocaleString()}`);
+      if (transfer.notes?.trim()) lines.push(`Notes: ${transfer.notes.trim()}`);
+      lines.push('');
+    }
   }
 
   return lines.join('\n');
@@ -188,7 +312,10 @@ export interface InquiryPayload {
   message?: string;
   plannerName: string;
   items: ItineraryItem[];
+  stays?: StayItem[];
+  transfers?: TransferItem[];
   total: number;
+  deposit?: number;
 }
 
 const MAILTO_SAFE_LIMIT = 1800;
@@ -199,9 +326,12 @@ export function buildInquiryPackageText(payload: InquiryPayload): string {
     payload.phone ? `Phone: ${payload.phone}` : null,
     payload.message?.trim() ? `Message:\n${payload.message.trim()}` : null,
     '',
-    '--- Agenda ---',
-    buildAgendaPlainText(payload.plannerName, payload.items),
+    '--- Package ---',
+    buildAgendaPlainText(payload.plannerName, payload.items, payload.stays, payload.transfers),
     `Grand total estimate: $${payload.total.toLocaleString()}`,
+    typeof payload.deposit === 'number'
+      ? `Reservation deposit (25%): $${payload.deposit.toLocaleString()}`
+      : null,
   ]
     .filter((line) => line !== null)
     .join('\n');
@@ -224,6 +354,8 @@ export function buildInquiryMailto(
     return { href: `mailto:${toAddress}?subject=${subject}&body=${encodedFull}`, truncated: false };
   }
 
+  const lineCount =
+    payload.items.length + (payload.stays?.length ?? 0) + (payload.transfers?.length ?? 0);
   const shortBody = [
     `Name: ${payload.name}`,
     `Email: ${payload.email}`,
@@ -231,8 +363,8 @@ export function buildInquiryMailto(
     '',
     payload.message?.trim() || null,
     '',
-    `Agenda: ${payload.items.length} items · est. $${payload.total.toLocaleString()}`,
-    '(Full agenda was copied to your clipboard — please paste it below.)',
+    `Package: ${lineCount} items · est. $${payload.total.toLocaleString()}`,
+    '(Full package was copied to your clipboard — please paste it below.)',
   ]
     .filter((line) => line !== null)
     .join('\n');

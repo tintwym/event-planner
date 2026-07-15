@@ -1,16 +1,26 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Mail, Send, Copy, CheckCircle } from 'lucide-react';
-import { ItineraryItem } from '../types';
+import { ItineraryItem, StayItem, TransferItem } from '../types';
 import { buildInquiryMailto, buildInquiryPackageText, downloadTextFile } from '../lib/export';
 
 interface InquiryFormProps {
   plannerName: string;
   items: ItineraryItem[];
+  stays?: StayItem[];
+  transfers?: TransferItem[];
   total: number;
+  deposit?: number;
 }
 
-export default function InquiryForm({ plannerName, items, total }: InquiryFormProps) {
+export default function InquiryForm({
+  plannerName,
+  items,
+  stays = [],
+  transfers = [],
+  total,
+  deposit,
+}: InquiryFormProps) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
@@ -26,7 +36,8 @@ export default function InquiryForm({ plannerName, items, total }: InquiryFormPr
     };
   }, []);
 
-  const disabled = items.length === 0;
+  const lineCount = items.length + stays.length + transfers.length;
+  const disabled = lineCount === 0;
 
   const payload = () => ({
     name: name.trim(),
@@ -35,7 +46,10 @@ export default function InquiryForm({ plannerName, items, total }: InquiryFormPr
     message: message.trim() || undefined,
     plannerName,
     items,
+    stays,
+    transfers,
     total,
+    deposit,
   });
 
   const handleMailto = async (e: React.FormEvent) => {
@@ -223,12 +237,15 @@ export default function InquiryForm({ plannerName, items, total }: InquiryFormPr
 
         {disabled ? (
           <p className="text-xs text-dark-text-tertiary">
-            Add at least one activity to your itinerary before requesting a proposal.
+            Add at least one item — event, stay, experience, or transfer — before requesting a
+            proposal.
           </p>
         ) : (
           <p className="text-[11px] text-dark-text-tertiary">
-            Your current agenda ({items.length} items · ${total.toLocaleString()}) will be attached
-            to the message.
+            Your full package ({lineCount} item{lineCount === 1 ? '' : 's'} · $
+            {total.toLocaleString()}
+            {typeof deposit === 'number' ? ` · deposit $${deposit.toLocaleString()}` : ''}) will be
+            attached to the message.
           </p>
         )}
 

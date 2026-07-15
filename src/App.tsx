@@ -29,11 +29,24 @@ import {
   Loader2,
   Download,
   LogOut,
+  BedDouble,
+  Car,
+  Wallet,
 } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 
-import { EventActivity, ItineraryItem, EventCategory, UserProfile } from './types';
+import {
+  EventActivity,
+  ItineraryItem,
+  EventCategory,
+  UserProfile,
+  LineKind,
+  StayItem,
+  TransferItem,
+  TransferMode,
+} from './types';
 import { CATALOG_ACTIVITIES } from './data/catalog';
+import { EXPERIENCES } from './data/experiences';
 import EventCard from './components/EventCard';
 import ItineraryItemView from './components/ItineraryItemView';
 import CustomEventForm from './components/CustomEventForm';
@@ -41,22 +54,87 @@ import DayTimeline from './components/DayTimeline';
 import InquiryForm from './components/InquiryForm';
 import LandingPage from './components/LandingPage';
 import LoginScreen from './components/LoginScreen';
+import StayPlanner from './components/StayPlanner';
+import StayItemView from './components/StayItemView';
+import TransferPlanner from './components/TransferPlanner';
+import TransferItemView from './components/TransferItemView';
 import {
+  addDaysISO,
   defaultDurationMinutes,
   findConflicts,
   findTransitGaps,
+  formatDisplayDate,
+  formatMinutes,
   groupByDate,
+  getItemWindow,
+  timeToMinutes,
   itemHasConflict,
   itemHasTransitGap,
   sortItineraryChronologically,
 } from './lib/schedule';
 import { downloadIcs } from './lib/export';
+import { computePackageTotals, stayLineTotal, transferLineTotal } from './lib/pricing';
+import { getRoomType } from './data/stays';
+import { priceTransfer, getTransferMode } from './data/transfers';
 import {
   evaluateOutdoorWeatherRisks,
   formatStationCoordinates,
 } from './lib/weatherRisk';
 import VenueMap from './components/VenueMap';
 import { VENUES } from './data/venues';
+
+/** Catalog + curated experiences share the EventActivity shape for lookups. */
+const ALL_ACTIVITIES: EventActivity[] = [...CATALOG_ACTIVITIES, ...EXPERIENCES];
+
+/**
+ * Suggest transfers between consecutive same-day events at different venues
+ * that don't already have a transfer booked.
+ */
+function computeTransferSuggestions(
+  itinerary: ItineraryItem[],
+  transfers: TransferItem[]
+): Omit<TransferItem, 'id'>[] {
+  const suggestions: Omit<TransferItem, 'id'>[] = [];
+  const byDate = new Map<string, ItineraryItem[]>();
+  for (const item of itinerary) {
+    if (!item.venueId) continue;
+    const list = byDate.get(item.date) ?? [];
+    list.push(item);
+    byDate.set(item.date, list);
+  }
+
+  const seen = new Set(
+    transfers.map((t) => `${t.date}|${t.fromVenueId}|${t.toVenueId}`)
+  );
+
+  for (const [date, dayItems] of byDate) {
+    const sorted = [...dayItems].sort(
+      (a, b) => timeToMinutes(a.time) - timeToMinutes(b.time) || a.id.localeCompare(b.id)
+    );
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const from = sorted[i];
+      const to = sorted[i + 1];
+      if (!from.venueId || !to.venueId || from.venueId === to.venueId) continue;
+      const key = `${date}|${from.venueId}|${to.venueId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const pax = Math.max(1, from.guests, to.guests);
+      const mode: TransferMode = pax > 7 ? 'van' : 'sedan';
+      const { end } = getItemWindow(from);
+      suggestions.push({
+        fromVenueId: from.venueId,
+        toVenueId: to.venueId,
+        mode,
+        date,
+        time: formatMinutes(end),
+        pax,
+        price: priceTransfer(from.venueId, to.venueId, mode, pax),
+      });
+    }
+  }
+
+  return suggestions;
+}
 
 function localTodayISO() {
   const d = new Date();
@@ -95,7 +173,7 @@ function normalizeItineraryItem(item: ItineraryItem): ItineraryItem {
 
 function repriceItem(item: ItineraryItem): ItineraryItem {
   const associated = item.activityId
-    ? CATALOG_ACTIVITIES.find((a) => a.id === item.activityId)
+    ? ALL_ACTIVITIES.find((a) => a.id === item.activityId)
     : undefined;
   const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
   const maxGuests = Math.min(
@@ -121,37 +199,108 @@ function repriceItem(item: ItineraryItem): ItineraryItem {
   return { ...item, guests, calculatedPrice, durationMinutes };
 }
 
-function guestItineraryCount(): number {
+function isValidStayItem(item: unknown): item is StayItem {
+  if (!item || typeof item !== 'object') return false;
+  const row = item as Record<string, unknown>;
+  return (
+    typeof row.id === 'string' &&
+    typeof row.venueId === 'string' &&
+    typeof row.roomTypeId === 'string' &&
+    typeof row.checkIn === 'string' &&
+    typeof row.nights === 'number' &&
+    Number.isFinite(row.nights) &&
+    typeof row.rooms === 'number' &&
+    Number.isFinite(row.rooms) &&
+    typeof row.ratePerNight === 'number' &&
+    Number.isFinite(row.ratePerNight)
+  );
+}
+
+function normalizeStayItem(stay: StayItem): StayItem {
+  const roomType = getRoomType(stay.roomTypeId);
+  const rooms = Math.max(1, Math.round(stay.rooms || 1));
+  const maxGuests = roomType ? roomType.sleeps * rooms : Number.POSITIVE_INFINITY;
+  return {
+    ...stay,
+    nights: Math.min(60, Math.max(1, Math.round(stay.nights || 1))),
+    rooms: roomType ? Math.min(roomType.count, rooms) : rooms,
+    guests: Math.min(maxGuests, Math.max(1, Math.round(stay.guests || 1))),
+    ratePerNight: roomType ? roomType.ratePerNight : Math.max(0, stay.ratePerNight || 0),
+    notes: typeof stay.notes === 'string' ? stay.notes : undefined,
+  };
+}
+
+function isValidTransferItem(item: unknown): item is TransferItem {
+  if (!item || typeof item !== 'object') return false;
+  const row = item as Record<string, unknown>;
+  return (
+    typeof row.id === 'string' &&
+    typeof row.fromVenueId === 'string' &&
+    typeof row.toVenueId === 'string' &&
+    row.fromVenueId !== row.toVenueId &&
+    typeof row.mode === 'string' &&
+    typeof row.date === 'string' &&
+    typeof row.time === 'string' &&
+    typeof row.pax === 'number' &&
+    Number.isFinite(row.pax) &&
+    typeof row.price === 'number' &&
+    Number.isFinite(row.price)
+  );
+}
+
+function normalizeTransferItem(transfer: TransferItem): TransferItem {
+  const pax = Math.min(200, Math.max(1, Math.round(transfer.pax || 1)));
+  const mode = getTransferMode(transfer.mode).id;
+  return {
+    ...transfer,
+    mode,
+    pax,
+    price: priceTransfer(transfer.fromVenueId, transfer.toVenueId, mode, pax),
+    notes: typeof transfer.notes === 'string' ? transfer.notes : undefined,
+  };
+}
+
+function readArray(key: string): unknown[] {
   try {
-    const raw = localStorage.getItem('villa_hotel_itinerary_guest');
-    if (!raw) return 0;
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.length : 0;
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return 0;
+    return [];
   }
 }
 
-function userHasItinerary(userId: string): boolean {
-  try {
-    const raw = localStorage.getItem(`villa_hotel_itinerary_${userId}`);
-    if (!raw) return false;
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.length > 0;
-  } catch {
-    return false;
-  }
+/** Total guest package items across itinerary, stays and transfers. */
+function guestPackageCount(): number {
+  return (
+    readArray('villa_hotel_itinerary_guest').length +
+    readArray('villa_hotel_stays_guest').length +
+    readArray('villa_hotel_transfers_guest').length
+  );
 }
 
-function migrateGuestItineraryToUser(userId: string): void {
-  const guestRaw = localStorage.getItem('villa_hotel_itinerary_guest');
-  if (!guestRaw) return;
+function userHasPackage(userId: string): boolean {
+  return (
+    readArray(`villa_hotel_itinerary_${userId}`).length > 0 ||
+    readArray(`villa_hotel_stays_${userId}`).length > 0 ||
+    readArray(`villa_hotel_transfers_${userId}`).length > 0
+  );
+}
+
+function migrateGuestPackageToUser(userId: string): void {
+  if (userHasPackage(userId)) return;
+  const moveKey = (guestKey: string, userKey: string) => {
+    const raw = localStorage.getItem(guestKey);
+    if (raw && readArray(guestKey).length > 0) {
+      localStorage.setItem(userKey, raw);
+    }
+    localStorage.removeItem(guestKey);
+  };
   try {
-    const guestItems = JSON.parse(guestRaw);
-    if (!Array.isArray(guestItems) || guestItems.length === 0) return;
-    if (userHasItinerary(userId)) return;
-    localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(guestItems));
-    localStorage.removeItem('villa_hotel_itinerary_guest');
+    moveKey('villa_hotel_itinerary_guest', `villa_hotel_itinerary_${userId}`);
+    moveKey('villa_hotel_stays_guest', `villa_hotel_stays_${userId}`);
+    moveKey('villa_hotel_transfers_guest', `villa_hotel_transfers_${userId}`);
     const guestName = localStorage.getItem('villa_hotel_planner_name_guest');
     if (guestName) {
       localStorage.setItem(`villa_hotel_planner_name_${userId}`, guestName);
@@ -166,15 +315,21 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [showLogin, setShowLogin] = useState(false);
   const [showPlanner, setShowPlanner] = useState(false);
-  const [viewMode, setViewMode] = useState<'catalog' | 'map'>('catalog');
+  const [viewMode, setViewMode] = useState<
+    'catalog' | 'experiences' | 'stays' | 'transfers' | 'map'
+  >('catalog');
   const [mapSelectedDate, setMapSelectedDate] = useState(localTodayISO);
   // Filters & Search
   const [selectedLocation, setSelectedLocation] = useState<'All' | 'Villa' | 'Hotel'>('All');
   const [selectedCategory, setSelectedCategory] = useState<'All' | EventCategory>('All');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Itinerary State
+  // Itinerary State (events + experiences)
   const [itinerary, setItinerary] = useState<ItineraryItem[]>([]);
+  // Package add-ons: lodging and transfers live in their own arrays so they
+  // never interfere with event scheduling / conflict logic.
+  const [stays, setStays] = useState<StayItem[]>([]);
+  const [transfers, setTransfers] = useState<TransferItem[]>([]);
 
   // Client name or wedding couple name
   const [plannerName, setPlannerName] = useState('Signature Occasion');
@@ -246,6 +401,8 @@ export default function App() {
     const userId = currentUser ? currentUser.id : 'guest';
     setIsHydrating(true);
     setItinerary([]);
+    setStays([]);
+    setTransfers([]);
 
     const savedItinerary = localStorage.getItem(`villa_hotel_itinerary_${userId}`);
     if (savedItinerary) {
@@ -268,6 +425,17 @@ export default function App() {
       setItinerary([]);
     }
 
+    setStays(
+      readArray(`villa_hotel_stays_${userId}`)
+        .filter(isValidStayItem)
+        .map(normalizeStayItem)
+    );
+    setTransfers(
+      readArray(`villa_hotel_transfers_${userId}`)
+        .filter(isValidTransferItem)
+        .map(normalizeTransferItem)
+    );
+
     const savedName = localStorage.getItem(`villa_hotel_planner_name_${userId}`);
     setPlannerName(
       savedName || (currentUser ? `${currentUser.name}'s Celebration` : 'Signature Occasion')
@@ -288,6 +456,18 @@ export default function App() {
   useEffect(() => {
     if (isHydrating) return;
     const userId = currentUser ? currentUser.id : 'guest';
+    localStorage.setItem(`villa_hotel_stays_${userId}`, JSON.stringify(stays));
+  }, [stays, isHydrating, currentUser]);
+
+  useEffect(() => {
+    if (isHydrating) return;
+    const userId = currentUser ? currentUser.id : 'guest';
+    localStorage.setItem(`villa_hotel_transfers_${userId}`, JSON.stringify(transfers));
+  }, [transfers, isHydrating, currentUser]);
+
+  useEffect(() => {
+    if (isHydrating) return;
+    const userId = currentUser ? currentUser.id : 'guest';
     localStorage.setItem(`villa_hotel_planner_name_${userId}`, plannerName);
   }, [plannerName, isHydrating, currentUser]);
 
@@ -296,6 +476,8 @@ export default function App() {
     const userId = currentUser ? currentUser.id : 'guest';
     const interval = setInterval(() => {
       localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(itinerary));
+      localStorage.setItem(`villa_hotel_stays_${userId}`, JSON.stringify(stays));
+      localStorage.setItem(`villa_hotel_transfers_${userId}`, JSON.stringify(transfers));
       localStorage.setItem(`villa_hotel_planner_name_${userId}`, plannerName);
       const now = new Date();
       const timeStr = now.toLocaleTimeString([], {
@@ -308,7 +490,7 @@ export default function App() {
     }, 30000);
 
     return () => clearInterval(interval);
-  }, [itinerary, plannerName, currentUser, isHydrating]);
+  }, [itinerary, stays, transfers, plannerName, currentUser, isHydrating]);
 
   // Fetch weather forecast with AbortController (ignore aborted / stale responses)
   useEffect(() => {
@@ -429,8 +611,8 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [showSummaryModal]);
 
-  // Handle adding pre-defined activity to itinerary
-  const handleAddActivity = (activity: EventActivity) => {
+  // Handle adding pre-defined activity or curated experience to itinerary
+  const handleAddActivity = (activity: EventActivity, kind: LineKind = 'event') => {
     if (isHydrating) return;
     setItinerary((prev) => {
       if (prev.some((item) => item.activityId === activity.id)) return prev;
@@ -438,7 +620,7 @@ export default function App() {
       const guests = Math.min(10, activity.maxGuests);
       const targetLoc = activity.location === 'Both' ? 'Villa' : (activity.location as 'Villa' | 'Hotel');
       const defaultVenue = VENUES.find((v) => v.type === targetLoc);
-      
+
       const newItem: ItineraryItem = {
         id: `itinerary-${activity.id}-${Date.now()}`,
         activityId: activity.id,
@@ -446,16 +628,75 @@ export default function App() {
         location: targetLoc,
         category: activity.category,
         date: localTodayISO(),
-        time: '18:00',
+        time: kind === 'experience' ? '12:00' : '18:00',
         guests,
         notes: '',
+        basePrice: activity.basePrice,
+        pricePerGuest: activity.pricePerGuest,
         calculatedPrice: activity.basePrice + guests * activity.pricePerGuest,
         venueId: defaultVenue ? defaultVenue.id : undefined,
         durationMinutes: activity.durationMinutes,
+        kind,
       };
 
       return [...prev, newItem];
     });
+  };
+
+  // --- Stays ---
+  const handleAddStay = (stay: Omit<StayItem, 'id'>) => {
+    if (isHydrating) return;
+    setStays((prev) => [
+      ...prev,
+      normalizeStayItem({ ...stay, id: `stay-${Date.now()}` }),
+    ]);
+  };
+
+  const handleUpdateStay = (id: string, patch: Partial<StayItem>) => {
+    if (isHydrating) return;
+    setStays((prev) =>
+      prev.map((stay) => (stay.id === id ? normalizeStayItem({ ...stay, ...patch }) : stay))
+    );
+  };
+
+  const handleRemoveStay = (id: string) => {
+    if (isHydrating) return;
+    setStays((prev) => prev.filter((stay) => stay.id !== id));
+  };
+
+  // --- Transfers ---
+  const handleAddTransfer = (transfer: Omit<TransferItem, 'id'>) => {
+    if (isHydrating) return;
+    setTransfers((prev) => [
+      ...prev,
+      normalizeTransferItem({ ...transfer, id: `transfer-${Date.now()}` }),
+    ]);
+  };
+
+  const handleUpdateTransfer = (id: string, patch: Partial<TransferItem>) => {
+    if (isHydrating) return;
+    setTransfers((prev) =>
+      prev.map((transfer) =>
+        transfer.id === id ? normalizeTransferItem({ ...transfer, ...patch }) : transfer
+      )
+    );
+  };
+
+  const handleRemoveTransfer = (id: string) => {
+    if (isHydrating) return;
+    setTransfers((prev) => prev.filter((transfer) => transfer.id !== id));
+  };
+
+  const handleAutoSuggestTransfers = () => {
+    if (isHydrating) return;
+    const suggestions = computeTransferSuggestions(itinerary, transfers);
+    if (suggestions.length === 0) return;
+    setTransfers((prev) => [
+      ...prev,
+      ...suggestions.map((s, idx) =>
+        normalizeTransferItem({ ...s, id: `transfer-auto-${Date.now()}-${idx}` })
+      ),
+    ]);
   };
 
   // Handle adding custom-built activity
@@ -500,11 +741,13 @@ export default function App() {
     setItinerary((prev) => prev.filter((item) => item.id !== id));
   };
 
-  // Clear all itinerary items
+  // Clear all package items (events, experiences, stays, transfers)
   const handleClearAll = () => {
     if (isHydrating) return;
-    if (window.confirm('Are you sure you want to clear your entire event itinerary?')) {
+    if (window.confirm('Are you sure you want to clear your entire package (events, stays & transfers)?')) {
       setItinerary([]);
+      setStays([]);
+      setTransfers([]);
     }
   };
 
@@ -513,6 +756,8 @@ export default function App() {
     if (isHydrating) return;
     const userId = currentUser ? currentUser.id : 'guest';
     localStorage.setItem(`villa_hotel_itinerary_${userId}`, JSON.stringify(itinerary));
+    localStorage.setItem(`villa_hotel_stays_${userId}`, JSON.stringify(stays));
+    localStorage.setItem(`villa_hotel_transfers_${userId}`, JSON.stringify(transfers));
     localStorage.setItem(`villa_hotel_planner_name_${userId}`, plannerName);
     const now = new Date();
     const timeStr = now.toLocaleTimeString([], {
@@ -569,7 +814,9 @@ export default function App() {
   });
 
   // Calculations for Pricing & Summaries
-  const totalEstimatedCost = itinerary.reduce((sum, item) => sum + item.calculatedPrice, 0);
+  const totals = computePackageTotals({ itinerary, stays, transfers });
+  const totalEstimatedCost = totals.grandTotal;
+  const transferSuggestions = computeTransferSuggestions(itinerary, transfers);
   const totalGuestsMax = itinerary.reduce((max, item) => Math.max(max, item.guests), 0);
   const weddingCount = itinerary.filter((item) => item.category === 'Weddings').length;
   const dinnerCount = itinerary.filter((item) => item.category === 'Dinners').length;
@@ -597,17 +844,17 @@ export default function App() {
   const chronologicalItinerary = sortItineraryChronologically(itinerary);
 
   const handleAuthenticated = (user: UserProfile) => {
-    const guestCount = guestItineraryCount();
+    const guestCount = guestPackageCount();
     if (guestCount > 0) {
-      if (userHasItinerary(user.id)) {
+      if (userHasPackage(user.id)) {
         window.alert(
-          'Guest itinerary kept separate — this account already has saved events. Continue as this account without overwriting.'
+          'Guest package kept separate — this account already has saved items. Continue as this account without overwriting.'
         );
       } else {
         const bring = window.confirm(
-          `You have ${guestCount} guest event(s). Bring them onto this account?`
+          `You have ${guestCount} guest package item(s). Bring them onto this account?`
         );
-        if (bring) migrateGuestItineraryToUser(user.id);
+        if (bring) migrateGuestPackageToUser(user.id);
       }
     }
     setCurrentUser(user);
@@ -771,7 +1018,7 @@ export default function App() {
             href="#itinerary-column"
             className="flex-1 text-center text-[11px] font-bold uppercase tracking-wider py-2.5 rounded-xl bg-dark-card border border-dark-border text-dark-text-secondary hover:text-gold-premium hover:border-gold-premium/40 transition-colors"
           >
-            Plan{itinerary.length > 0 ? ` (${itinerary.length})` : ''}
+            Plan{totals.itemCount > 0 ? ` (${totals.itemCount})` : ''}
           </a>
           <div className="shrink-0 px-2.5 py-2 rounded-xl bg-dark-card border border-dark-border text-right min-w-18">
             <span className="block text-[9px] uppercase tracking-wider text-dark-text-tertiary font-bold">
@@ -1097,37 +1344,37 @@ export default function App() {
       >
         {/* LEFT COLUMN: Catalog Showcase & Exploration (cols 7) */}
         <div className="lg:col-span-7 flex flex-col space-y-5 scroll-mt-28 lg:scroll-mt-4" id="catalog-explorer-column">
-          {/* Dashboard Mode Selector: Catalog vs Map */}
-          <div className="flex items-center gap-2 bg-dark-card border border-dark-border rounded-2xl p-1.5 shadow-md shrink-0">
-            <button
-              onClick={() => setViewMode('catalog')}
-              aria-pressed={viewMode === 'catalog'}
-              className={`flex-1 py-2.5 text-[11px] sm:text-xs font-bold uppercase tracking-wider rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-                viewMode === 'catalog'
-                  ? 'bg-gold-premium text-[#0A0A0A] shadow-xs'
-                  : 'text-dark-text-secondary hover:text-dark-text-primary'
-              }`}
-            >
-              <Compass className="w-4 h-4" />
-              <span className="sm:hidden">Catalog</span>
-              <span className="hidden sm:inline">Curated Catalog</span>
-            </button>
-            <button
-              onClick={() => setViewMode('map')}
-              aria-pressed={viewMode === 'map'}
-              className={`flex-1 py-2.5 text-[11px] sm:text-xs font-bold uppercase tracking-wider rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-                viewMode === 'map'
-                  ? 'bg-gold-premium text-[#0A0A0A] shadow-xs'
-                  : 'text-dark-text-secondary hover:text-dark-text-primary'
-              }`}
-            >
-              <MapPin className="w-4 h-4" />
-              <span className="sm:hidden">Map</span>
-              <span className="hidden sm:inline">Interactive Venue Map</span>
-            </button>
+          {/* Package Composer Tabs */}
+          <div
+            className="flex items-center gap-1.5 bg-dark-card border border-dark-border rounded-2xl p-1.5 shadow-md shrink-0 overflow-x-auto scrollbar-none"
+            role="tablist"
+            aria-label="Package composer sections"
+          >
+            {[
+              { id: 'catalog' as const, label: 'Events', Icon: Compass },
+              { id: 'experiences' as const, label: 'Experiences', Icon: Sparkles },
+              { id: 'stays' as const, label: 'Stays', Icon: BedDouble },
+              { id: 'transfers' as const, label: 'Transfers', Icon: Car },
+              { id: 'map' as const, label: 'Map', Icon: MapPin },
+            ].map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                role="tab"
+                onClick={() => setViewMode(id)}
+                aria-selected={viewMode === id}
+                className={`shrink-0 flex-1 min-w-[80px] py-2.5 px-2 text-[11px] sm:text-xs font-bold uppercase tracking-wider rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  viewMode === id
+                    ? 'bg-gold-premium text-[#0A0A0A] shadow-xs'
+                    : 'text-dark-text-secondary hover:text-dark-text-primary'
+                }`}
+              >
+                <Icon className="w-4 h-4" />
+                <span>{label}</span>
+              </button>
+            ))}
           </div>
 
-          {viewMode === 'catalog' ? (
+          {viewMode === 'catalog' && (
             <>
               {/* Filters and Search toolbar */}
           <div className="bg-dark-card border border-dark-border rounded-2xl p-4 shadow-lg flex flex-col gap-4">
@@ -1151,107 +1398,111 @@ export default function App() {
 
             <div className="flex flex-col gap-2.5">
               <div
-                className="flex items-center gap-1.5 flex-wrap"
+                className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:flex-wrap"
                 role="group"
                 aria-label="Filter by location"
               >
-                <span className="text-[11px] uppercase font-bold text-dark-text-secondary min-w-[65px] tracking-wider">
+                <span className="text-[11px] uppercase font-bold text-dark-text-secondary sm:min-w-[65px] tracking-wider">
                   Location:
                 </span>
-                <button
-                  onClick={() => setSelectedLocation('All')}
-                  aria-pressed={selectedLocation === 'All'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer uppercase tracking-wider ${
-                    selectedLocation === 'All'
-                      ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-loc-all"
-                >
-                  All Venues
-                </button>
-                <button
-                  onClick={() => setSelectedLocation('Villa')}
-                  aria-pressed={selectedLocation === 'Villa'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
-                    selectedLocation === 'Villa'
-                      ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-loc-villa"
-                >
-                  <Home className="w-3 h-3" /> Private Villas
-                </button>
-                <button
-                  onClick={() => setSelectedLocation('Hotel')}
-                  aria-pressed={selectedLocation === 'Hotel'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
-                    selectedLocation === 'Hotel'
-                      ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-loc-hotel"
-                >
-                  <Palmtree className="w-3 h-3" /> Luxury Hotels
-                </button>
+                <div className="flex items-center gap-1.5 overflow-x-auto -mx-4 px-4 scrollbar-none sm:contents">
+                  <button
+                    onClick={() => setSelectedLocation('All')}
+                    aria-pressed={selectedLocation === 'All'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer uppercase tracking-wider ${
+                      selectedLocation === 'All'
+                        ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-loc-all"
+                  >
+                    All Venues
+                  </button>
+                  <button
+                    onClick={() => setSelectedLocation('Villa')}
+                    aria-pressed={selectedLocation === 'Villa'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
+                      selectedLocation === 'Villa'
+                        ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-loc-villa"
+                  >
+                    <Home className="w-3 h-3" /> Private Villas
+                  </button>
+                  <button
+                    onClick={() => setSelectedLocation('Hotel')}
+                    aria-pressed={selectedLocation === 'Hotel'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
+                      selectedLocation === 'Hotel'
+                        ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-loc-hotel"
+                  >
+                    <Palmtree className="w-3 h-3" /> Luxury Hotels
+                  </button>
+                </div>
               </div>
 
               <div
-                className="flex items-center gap-1.5 flex-wrap"
+                className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:flex-wrap"
                 role="group"
                 aria-label="Filter by category"
               >
-                <span className="text-[11px] uppercase font-bold text-dark-text-secondary min-w-[65px] tracking-wider">
+                <span className="text-[11px] uppercase font-bold text-dark-text-secondary sm:min-w-[65px] tracking-wider">
                   Category:
                 </span>
-                <button
-                  onClick={() => setSelectedCategory('All')}
-                  aria-pressed={selectedCategory === 'All'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer uppercase tracking-wider ${
-                    selectedCategory === 'All'
-                      ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-cat-all"
-                >
-                  All Events
-                </button>
-                <button
-                  onClick={() => setSelectedCategory('Weddings')}
-                  aria-pressed={selectedCategory === 'Weddings'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
-                    selectedCategory === 'Weddings'
-                      ? 'bg-rose-500/15 border-rose-500/30 text-rose-600 dark:text-rose-300'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-cat-wedding"
-                >
-                  <Heart className="w-3 h-3" /> Weddings
-                </button>
-                <button
-                  onClick={() => setSelectedCategory('Dinners')}
-                  aria-pressed={selectedCategory === 'Dinners'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
-                    selectedCategory === 'Dinners'
-                      ? 'bg-orange-500/15 border-orange-500/30 text-orange-600 dark:text-orange-300'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-cat-dinner"
-                >
-                  <Utensils className="w-3 h-3" /> Dinners
-                </button>
-                <button
-                  onClick={() => setSelectedCategory('Activities')}
-                  aria-pressed={selectedCategory === 'Activities'}
-                  className={`px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
-                    selectedCategory === 'Activities'
-                      ? 'bg-sky-500/15 border-sky-500/30 text-sky-600 dark:text-sky-300'
-                      : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
-                  }`}
-                  id="filter-cat-activities"
-                >
-                  <Compass className="w-3 h-3" /> Activities
-                </button>
+                <div className="flex items-center gap-1.5 overflow-x-auto -mx-4 px-4 scrollbar-none sm:contents">
+                  <button
+                    onClick={() => setSelectedCategory('All')}
+                    aria-pressed={selectedCategory === 'All'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer uppercase tracking-wider ${
+                      selectedCategory === 'All'
+                        ? 'bg-gold-premium border-gold-premium text-[#0A0A0A]'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-cat-all"
+                  >
+                    All Events
+                  </button>
+                  <button
+                    onClick={() => setSelectedCategory('Weddings')}
+                    aria-pressed={selectedCategory === 'Weddings'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
+                      selectedCategory === 'Weddings'
+                        ? 'bg-rose-500/15 border-rose-500/30 text-rose-600 dark:text-rose-300'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-cat-wedding"
+                  >
+                    <Heart className="w-3 h-3" /> Weddings
+                  </button>
+                  <button
+                    onClick={() => setSelectedCategory('Dinners')}
+                    aria-pressed={selectedCategory === 'Dinners'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
+                      selectedCategory === 'Dinners'
+                        ? 'bg-orange-500/15 border-orange-500/30 text-orange-600 dark:text-orange-300'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-cat-dinner"
+                  >
+                    <Utensils className="w-3 h-3" /> Dinners
+                  </button>
+                  <button
+                    onClick={() => setSelectedCategory('Activities')}
+                    aria-pressed={selectedCategory === 'Activities'}
+                    className={`shrink-0 px-3 py-1 text-xs font-bold rounded transition-colors border cursor-pointer flex items-center gap-1 uppercase tracking-wider ${
+                      selectedCategory === 'Activities'
+                        ? 'bg-sky-500/15 border-sky-500/30 text-sky-600 dark:text-sky-300'
+                        : 'bg-dark-input border-dark-border text-dark-text-secondary hover:text-dark-text-primary'
+                    }`}
+                    id="filter-cat-activities"
+                  >
+                    <Compass className="w-3 h-3" /> Activities
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1303,11 +1554,59 @@ export default function App() {
           </div>
 
           <CustomEventForm onAddCustomItem={handleAddCustomItem} />
+            </>
+          )}
+
+          {viewMode === 'experiences' && (
+            <div className="flex flex-col gap-4">
+              <div className="bg-dark-card border border-dark-border rounded-2xl p-4 shadow-lg">
+                <h2 className="font-serif font-light text-lg text-dark-text-primary flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-gold-premium" /> Curated Experiences
+                </h2>
+                <p className="text-[11px] uppercase tracking-wider font-semibold text-dark-text-tertiary mt-0.5">
+                  Add-on experiences to round out your stay — bucketed separately in your package
+                </p>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4" id="experiences-cards-grid">
+                <AnimatePresence mode="popLayout">
+                  {EXPERIENCES.map((exp) => (
+                    <EventCard
+                      key={exp.id}
+                      activity={exp}
+                      onAddToItinerary={(a) => handleAddActivity(a, 'experience')}
+                      isAdded={itinerary.some((item) => item.activityId === exp.id)}
+                    />
+                  ))}
+                </AnimatePresence>
+              </div>
+            </div>
+          )}
+
+          {viewMode === 'stays' && <StayPlanner onAddStay={handleAddStay} />}
+
+          {viewMode === 'transfers' && (
+            <TransferPlanner
+              onAddTransfer={handleAddTransfer}
+              onAutoSuggest={handleAutoSuggestTransfers}
+              suggestionCount={transferSuggestions.length}
+            />
+          )}
+
+          {viewMode === 'map' && (
+            <VenueMap
+              itinerary={itinerary}
+              selectedDate={mapSelectedDate}
+              onSelectDate={setMapSelectedDate}
+            />
+          )}
 
           <InquiryForm
             plannerName={plannerName}
             items={itinerary}
-            total={totalEstimatedCost}
+            stays={stays}
+            transfers={transfers}
+            total={totals.grandTotal}
+            deposit={totals.deposit}
           />
 
           {/* AI Mood Board & Theme Generator */}
@@ -1429,14 +1728,6 @@ export default function App() {
               )}
             </div>
           </div>
-          </>
-          ) : (
-            <VenueMap
-              itinerary={itinerary}
-              selectedDate={mapSelectedDate}
-              onSelectDate={setMapSelectedDate}
-            />
-          )}
         </div>
 
         {/* RIGHT COLUMN: Active Event Itinerary (cols 5) */}
@@ -1452,7 +1743,7 @@ export default function App() {
                 </p>
               </div>
 
-              {itinerary.length > 0 && (
+              {totals.itemCount > 0 && (
                 <button
                   onClick={handleClearAll}
                   className="text-xs font-bold uppercase tracking-wider text-rose-400 hover:text-rose-300 hover:bg-rose-950/30 px-2.5 py-1.5 rounded transition-colors cursor-pointer"
@@ -1467,7 +1758,7 @@ export default function App() {
               className="flex-1 overflow-visible max-h-none lg:overflow-y-auto lg:max-h-[640px] space-y-4 pt-4 pb-36 lg:pb-4"
               id="itinerary-items-list-container"
             >
-              {itinerary.length === 0 ? (
+              {totals.itemCount === 0 ? (
                 <div
                   className="py-12 px-6 text-center border border-dashed border-dark-border rounded-2xl"
                   id="itinerary-empty-state"
@@ -1515,28 +1806,68 @@ export default function App() {
                 </div>
               ) : (
                 <div className="space-y-4 pr-1">
-                  <DayTimeline
-                    groups={dayGroups}
-                    conflicts={scheduleConflicts}
-                    transitGaps={transitGaps}
-                  />
-                  <AnimatePresence mode="popLayout">
-                    {chronologicalItinerary.map((item) => {
-                      const associated = CATALOG_ACTIVITIES.find((a) => a.id === item.activityId);
-                      return (
-                        <ItineraryItemView
-                          key={item.id}
-                          item={item}
-                          associatedActivity={associated}
-                          onUpdate={handleUpdateItem}
-                          onRemove={handleRemoveItem}
-                          allowLocationSwitch={associated?.location === 'Both'}
-                          hasConflict={itemHasConflict(item.id, scheduleConflicts)}
-                          hasTransitGap={itemHasTransitGap(item.id, transitGaps)}
-                        />
-                      );
-                    })}
-                  </AnimatePresence>
+                  {itinerary.length > 0 && (
+                    <>
+                      <DayTimeline
+                        groups={dayGroups}
+                        conflicts={scheduleConflicts}
+                        transitGaps={transitGaps}
+                      />
+                      <AnimatePresence mode="popLayout">
+                        {chronologicalItinerary.map((item) => {
+                          const associated = ALL_ACTIVITIES.find((a) => a.id === item.activityId);
+                          return (
+                            <ItineraryItemView
+                              key={item.id}
+                              item={item}
+                              associatedActivity={associated}
+                              onUpdate={handleUpdateItem}
+                              onRemove={handleRemoveItem}
+                              allowLocationSwitch={associated?.location === 'Both'}
+                              hasConflict={itemHasConflict(item.id, scheduleConflicts)}
+                              hasTransitGap={itemHasTransitGap(item.id, transitGaps)}
+                            />
+                          );
+                        })}
+                      </AnimatePresence>
+                    </>
+                  )}
+
+                  {stays.length > 0 && (
+                    <div className="space-y-3">
+                      <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-gold-premium pt-1">
+                        <BedDouble className="w-4 h-4" aria-hidden="true" /> Stays ({stays.length})
+                      </h3>
+                      <AnimatePresence mode="popLayout">
+                        {stays.map((stay) => (
+                          <StayItemView
+                            key={stay.id}
+                            stay={stay}
+                            onUpdate={handleUpdateStay}
+                            onRemove={handleRemoveStay}
+                          />
+                        ))}
+                      </AnimatePresence>
+                    </div>
+                  )}
+
+                  {transfers.length > 0 && (
+                    <div className="space-y-3">
+                      <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-gold-premium pt-1">
+                        <Car className="w-4 h-4" aria-hidden="true" /> Transfers ({transfers.length})
+                      </h3>
+                      <AnimatePresence mode="popLayout">
+                        {transfers.map((transfer) => (
+                          <TransferItemView
+                            key={transfer.id}
+                            transfer={transfer}
+                            onUpdate={handleUpdateTransfer}
+                            onRemove={handleRemoveTransfer}
+                          />
+                        ))}
+                      </AnimatePresence>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1552,12 +1883,48 @@ export default function App() {
                     {totalGuestsMax} guests peak
                   </span>
                 </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-dark-text-secondary font-semibold">Scheduled Events Count</span>
-                  <span className="font-mono font-bold text-dark-text-primary">
-                    {itinerary.length} items
-                  </span>
-                </div>
+
+                {totals.eventsTotal > 0 && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-dark-text-secondary font-semibold">
+                      Events ({totals.eventCount})
+                    </span>
+                    <span className="font-mono font-bold text-dark-text-primary">
+                      ${totals.eventsTotal.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                {totals.experiencesTotal > 0 && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-dark-text-secondary font-semibold">
+                      Experiences ({totals.experienceCount})
+                    </span>
+                    <span className="font-mono font-bold text-dark-text-primary">
+                      ${totals.experiencesTotal.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                {totals.staysTotal > 0 && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-dark-text-secondary font-semibold">
+                      Stays ({totals.roomNights} room-nights)
+                    </span>
+                    <span className="font-mono font-bold text-dark-text-primary">
+                      ${totals.staysTotal.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                {totals.transfersTotal > 0 && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-dark-text-secondary font-semibold">
+                      Transfers ({totals.transferCount})
+                    </span>
+                    <span className="font-mono font-bold text-dark-text-primary">
+                      ${totals.transfersTotal.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+
                 <div className="flex items-center justify-between pt-2 border-t border-dashed border-dark-border">
                   <span className="font-serif font-bold text-dark-text-primary text-sm">
                     Estimated Grand Total
@@ -1567,18 +1934,31 @@ export default function App() {
                       ${totalEstimatedCost.toLocaleString()}
                     </span>
                     <span className="block text-[11px] text-dark-text-tertiary font-semibold">
-                      Includes setup &amp; guest multipliers
+                      {totals.itemCount} item{totals.itemCount === 1 ? '' : 's'} · setup &amp; guest
+                      multipliers
                     </span>
                   </div>
                 </div>
+
+                {totals.grandTotal > 0 && (
+                  <div className="flex items-center justify-between text-xs pt-1">
+                    <span className="text-dark-text-secondary font-semibold flex items-center gap-1">
+                      <Wallet className="w-3.5 h-3.5 text-gold-premium" aria-hidden="true" /> Reservation
+                      deposit (25%)
+                    </span>
+                    <span className="font-mono font-bold text-dark-text-primary">
+                      ${totals.deposit.toLocaleString()}
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-2">
                 <button
-                  disabled={itinerary.length === 0}
+                  disabled={totals.itemCount === 0}
                   onClick={() => setShowSummaryModal(true)}
                   className={`py-3 px-4 rounded font-bold text-xs uppercase tracking-widest transition-colors flex items-center justify-center gap-1.5 cursor-pointer ${
-                    itinerary.length === 0
+                    totals.itemCount === 0
                       ? 'bg-dark-input text-dark-text-tertiary border border-dark-border cursor-not-allowed shadow-none'
                       : 'border border-gold-premium text-gold-premium hover:bg-gold-premium/10'
                   }`}
@@ -1682,6 +2062,11 @@ export default function App() {
                     <span className="text-2xl font-extrabold text-gold-premium">
                       ${totalEstimatedCost.toLocaleString()}
                     </span>
+                    {totals.grandTotal > 0 && (
+                      <span className="block text-[11px] text-dark-text-tertiary font-semibold normal-case">
+                        Deposit to reserve (25%): ${totals.deposit.toLocaleString()}
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -1768,6 +2153,115 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {stays.length > 0 && (
+                  <div className="space-y-3">
+                    <h4 className="font-serif font-light text-sm text-dark-text-secondary border-b border-dark-border pb-1 uppercase tracking-wide flex items-center gap-2">
+                      <BedDouble className="w-4 h-4 text-gold-premium" aria-hidden="true" /> Accommodation ({stays.length})
+                    </h4>
+                    <div className="space-y-3">
+                      {stays
+                        .slice()
+                        .sort((a, b) => a.checkIn.localeCompare(b.checkIn))
+                        .map((stay) => {
+                          const venue = VENUES.find((v) => v.id === stay.venueId);
+                          const roomType = getRoomType(stay.roomTypeId);
+                          const nights = Math.max(1, Math.round(stay.nights || 1));
+                          const rooms = Math.max(1, Math.round(stay.rooms || 1));
+                          const checkOut = addDaysISO(stay.checkIn, nights);
+                          return (
+                            <div
+                              key={stay.id}
+                              className="bg-dark-bg p-4 rounded-xl border border-dark-border flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 text-xs"
+                            >
+                              <div className="space-y-1.5 flex-1">
+                                <h5 className="font-serif font-light text-dark-text-primary text-sm">
+                                  {roomType?.name ?? 'Room'} @ {venue?.name}
+                                </h5>
+                                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-dark-text-secondary font-medium">
+                                  <span className="flex items-center gap-1">
+                                    <Calendar className="w-3.5 h-3.5" /> {formatDisplayDate(stay.checkIn)} →{' '}
+                                    {formatDisplayDate(checkOut)}
+                                  </span>
+                                  <span className="flex items-center gap-1">
+                                    <Users className="w-3.5 h-3.5" /> {stay.guests} guests
+                                  </span>
+                                  <span>
+                                    {nights} night{nights === 1 ? '' : 's'} × {rooms} room
+                                    {rooms === 1 ? '' : 's'}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="text-right shrink-0 min-w-[100px]">
+                                <p className="font-mono font-bold text-gold-premium text-sm">
+                                  ${stayLineTotal(stay).toLocaleString()}
+                                </p>
+                                <span className="text-[11px] text-dark-text-tertiary font-semibold uppercase tracking-wider">
+                                  Stay
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )}
+
+                {transfers.length > 0 && (
+                  <div className="space-y-3">
+                    <h4 className="font-serif font-light text-sm text-dark-text-secondary border-b border-dark-border pb-1 uppercase tracking-wide flex items-center gap-2">
+                      <Car className="w-4 h-4 text-gold-premium" aria-hidden="true" /> Transfers ({transfers.length})
+                    </h4>
+                    <div className="space-y-3">
+                      {transfers
+                        .slice()
+                        .sort((a, b) => {
+                          const d = a.date.localeCompare(b.date);
+                          if (d !== 0) return d;
+                          return a.time.localeCompare(b.time);
+                        })
+                        .map((transfer) => {
+                          const fromName = VENUES.find((v) => v.id === transfer.fromVenueId)?.name;
+                          const toName = VENUES.find((v) => v.id === transfer.toVenueId)?.name;
+                          const modeInfo = getTransferMode(transfer.mode);
+                          return (
+                            <div
+                              key={transfer.id}
+                              className="bg-dark-bg p-4 rounded-xl border border-dark-border flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 text-xs"
+                            >
+                              <div className="space-y-1.5 flex-1">
+                                <h5 className="font-serif font-light text-dark-text-primary text-sm">
+                                  {fromName} → {toName}
+                                </h5>
+                                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-dark-text-secondary font-medium">
+                                  <span className="flex items-center gap-1">
+                                    <Calendar className="w-3.5 h-3.5" /> {transfer.date}
+                                  </span>
+                                  <span className="flex items-center gap-1">
+                                    <Clock className="w-3.5 h-3.5" /> {transfer.time}
+                                  </span>
+                                  <span className="flex items-center gap-1">
+                                    <Car className="w-3.5 h-3.5" /> {modeInfo.label}
+                                  </span>
+                                  <span className="flex items-center gap-1">
+                                    <Users className="w-3.5 h-3.5" /> {transfer.pax} pax
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="text-right shrink-0 min-w-[100px]">
+                                <p className="font-mono font-bold text-gold-premium text-sm">
+                                  ${transferLineTotal(transfer).toLocaleString()}
+                                </p>
+                                <span className="text-[11px] text-dark-text-tertiary font-semibold uppercase tracking-wider">
+                                  Transfer
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )}
 
                 <div className="bg-dark-bg p-5 rounded-2xl border border-dark-border space-y-4">
                   <h4 className="font-serif font-light text-sm text-dark-text-secondary uppercase tracking-wide">
@@ -1893,7 +2387,7 @@ export default function App() {
                 <div className="flex flex-wrap gap-2">
                   <button
                     type="button"
-                    onClick={() => downloadIcs(plannerName, itinerary)}
+                    onClick={() => downloadIcs(plannerName, itinerary, stays, transfers)}
                     className="px-4 py-2 border border-gold-premium text-gold-premium hover:bg-gold-premium/10 rounded text-xs font-bold uppercase tracking-widest transition-all cursor-pointer flex items-center gap-1.5"
                     id="download-ics-action-btn"
                   >

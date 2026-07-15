@@ -19,15 +19,30 @@ import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CATALOG_ACTIVITIES } from './src/data/catalog';
-import { EventActivity, ItineraryItem, EventCategory, UserProfile } from './src/types';
+import { EXPERIENCES } from './src/data/experiences';
+import {
+  EventActivity,
+  ItineraryItem,
+  EventCategory,
+  UserProfile,
+  LineKind,
+  StayItem,
+  TransferItem,
+  TransferMode,
+} from './src/types';
 import { VENUES } from './src/data/venues';
 import { MOCK_PROFILES } from './src/data/profiles';
+import { roomTypesForVenue, getRoomType } from './src/data/stays';
+import { TRANSFER_MODES, getTransferMode, priceTransfer } from './src/data/transfers';
+import { computePackageTotals, stayLineTotal, transferLineTotal } from './src/lib/pricing';
 import {
+  addDaysISO,
   dateToISODate,
   dateToTimeHM,
   defaultDurationMinutes,
   findConflicts,
   findTransitGaps,
+  formatDisplayDate,
   formatTimeRange,
   isValidISODate,
   isValidTimeHM,
@@ -82,6 +97,9 @@ const todayISO = () => {
   return `${y}-${m}-${day}`;
 };
 
+/** Catalog + curated experiences share the EventActivity shape for lookups. */
+const ALL_ACTIVITIES: EventActivity[] = [...CATALOG_ACTIVITIES, ...EXPERIENCES];
+
 function isValidItineraryItem(item: unknown): item is ItineraryItem {
   if (!item || typeof item !== 'object') return false;
   const row = item as Record<string, unknown>;
@@ -101,9 +119,73 @@ function isValidItineraryItem(item: unknown): item is ItineraryItem {
   );
 }
 
+function isValidStayItem(item: unknown): item is StayItem {
+  if (!item || typeof item !== 'object') return false;
+  const row = item as Record<string, unknown>;
+  return (
+    typeof row.id === 'string' &&
+    typeof row.venueId === 'string' &&
+    typeof row.roomTypeId === 'string' &&
+    typeof row.checkIn === 'string' &&
+    isValidISODate(row.checkIn) &&
+    typeof row.nights === 'number' &&
+    Number.isFinite(row.nights) &&
+    typeof row.rooms === 'number' &&
+    Number.isFinite(row.rooms) &&
+    typeof row.ratePerNight === 'number' &&
+    Number.isFinite(row.ratePerNight)
+  );
+}
+
+function normalizeStayItem(stay: StayItem): StayItem {
+  const roomType = getRoomType(stay.roomTypeId);
+  const rooms = Math.max(1, Math.round(stay.rooms || 1));
+  const maxGuests = roomType ? roomType.sleeps * rooms : Number.POSITIVE_INFINITY;
+  return {
+    ...stay,
+    nights: Math.min(60, Math.max(1, Math.round(stay.nights || 1))),
+    rooms: roomType ? Math.min(roomType.count, rooms) : rooms,
+    guests: Math.min(maxGuests, Math.max(1, Math.round(stay.guests || 1))),
+    ratePerNight: roomType ? roomType.ratePerNight : Math.max(0, stay.ratePerNight || 0),
+    notes: typeof stay.notes === 'string' ? stay.notes : undefined,
+  };
+}
+
+function isValidTransferItem(item: unknown): item is TransferItem {
+  if (!item || typeof item !== 'object') return false;
+  const row = item as Record<string, unknown>;
+  return (
+    typeof row.id === 'string' &&
+    typeof row.fromVenueId === 'string' &&
+    typeof row.toVenueId === 'string' &&
+    row.fromVenueId !== row.toVenueId &&
+    typeof row.mode === 'string' &&
+    typeof row.date === 'string' &&
+    isValidISODate(row.date) &&
+    typeof row.time === 'string' &&
+    isValidTimeHM(row.time) &&
+    typeof row.pax === 'number' &&
+    Number.isFinite(row.pax) &&
+    typeof row.price === 'number' &&
+    Number.isFinite(row.price)
+  );
+}
+
+function normalizeTransferItem(transfer: TransferItem): TransferItem {
+  const pax = Math.min(200, Math.max(1, Math.round(transfer.pax || 1)));
+  const mode = getTransferMode(transfer.mode).id;
+  return {
+    ...transfer,
+    mode,
+    pax,
+    price: priceTransfer(transfer.fromVenueId, transfer.toVenueId, mode, pax),
+    notes: typeof transfer.notes === 'string' ? transfer.notes : undefined,
+  };
+}
+
 function repriceItem(item: ItineraryItem): ItineraryItem {
   const associated = item.activityId
-    ? CATALOG_ACTIVITIES.find((a) => a.id === item.activityId)
+    ? ALL_ACTIVITIES.find((a) => a.id === item.activityId)
     : undefined;
   const venue = item.venueId ? VENUES.find((v) => v.id === item.venueId) : undefined;
   const maxGuests = Math.min(
@@ -158,13 +240,35 @@ function App() {
   const [selectedLocation, setSelectedLocation] = useState<'All' | 'Villa' | 'Hotel'>('All');
   const [selectedCategory, setSelectedCategory] = useState<'All' | EventCategory>('All');
   const [searchQuery, setSearchQuery] = useState('');
+  const [catalogMode, setCatalogMode] = useState<'events' | 'experiences'>('events');
   const [activeTab, setActiveTab] = useState(0); // 0 Catalog, 1 Itinerary, 2 Map, 3 AI/Weather, 4 Summary
 
-  // Itinerary state
+  // Itinerary state (events + experiences)
   const [itinerary, setItinerary] = useState<ItineraryItem[]>([]);
+  // Package add-ons kept in their own arrays so they never affect event scheduling.
+  const [stays, setStays] = useState<StayItem[]>([]);
+  const [transfers, setTransfers] = useState<TransferItem[]>([]);
   const [plannerName, setPlannerName] = useState('Signature Occasion');
   const [isHydrating, setIsHydrating] = useState(true);
   const hydrateGeneration = React.useRef(0);
+
+  // Stay creation modal state
+  const [stayModalVisible, setStayModalVisible] = useState(false);
+  const [stayVenueId, setStayVenueId] = useState(VENUES[0]?.id ?? '');
+  const [stayRoomTypeId, setStayRoomTypeId] = useState(roomTypesForVenue(VENUES[0]?.id ?? '')[0]?.id ?? '');
+  const [stayCheckIn, setStayCheckIn] = useState(todayISO);
+  const [stayNights, setStayNights] = useState('2');
+  const [stayRooms, setStayRooms] = useState('1');
+  const [stayGuests, setStayGuests] = useState('2');
+
+  // Transfer creation modal state
+  const [transferModalVisible, setTransferModalVisible] = useState(false);
+  const [transferFromId, setTransferFromId] = useState(VENUES[0]?.id ?? '');
+  const [transferToId, setTransferToId] = useState(VENUES[1]?.id ?? '');
+  const [transferMode, setTransferMode] = useState<TransferMode>('sedan');
+  const [transferDate, setTransferDate] = useState(todayISO);
+  const [transferTime, setTransferTime] = useState('12:00');
+  const [transferPax, setTransferPax] = useState('2');
 
   // Custom Event Form State
   const [customModalVisible, setCustomModalVisible] = useState(false);
@@ -188,6 +292,12 @@ function App() {
     const firstMatching = VENUES.find((v) => v.type === customLocation);
     setCustomVenueId(firstMatching ? firstMatching.id : '');
   }, [customLocation]);
+
+  // Keep the selected stay room type valid whenever the property changes
+  useEffect(() => {
+    const next = roomTypesForVenue(stayVenueId);
+    setStayRoomTypeId((prev) => (next.some((r) => r.id === prev) ? prev : next[0]?.id ?? ''));
+  }, [stayVenueId]);
 
   // Rename Modal State
   const [renameModalVisible, setRenameModalVisible] = useState(false);
@@ -217,6 +327,8 @@ function App() {
     const generation = ++hydrateGeneration.current;
     setIsHydrating(true);
     setItinerary([]);
+    setStays([]);
+    setTransfers([]);
 
     const loadState = async () => {
       try {
@@ -244,6 +356,26 @@ function App() {
           setItinerary([]);
         }
 
+        const savedStays = await AsyncStorage.getItem(`villa_hotel_stays_${userId}`);
+        if (generation !== hydrateGeneration.current) return;
+        if (savedStays) {
+          const parsed = JSON.parse(savedStays);
+          setStays(Array.isArray(parsed) ? parsed.filter(isValidStayItem).map(normalizeStayItem) : []);
+        } else {
+          setStays([]);
+        }
+
+        const savedTransfers = await AsyncStorage.getItem(`villa_hotel_transfers_${userId}`);
+        if (generation !== hydrateGeneration.current) return;
+        if (savedTransfers) {
+          const parsed = JSON.parse(savedTransfers);
+          setTransfers(
+            Array.isArray(parsed) ? parsed.filter(isValidTransferItem).map(normalizeTransferItem) : []
+          );
+        } else {
+          setTransfers([]);
+        }
+
         const savedName = await AsyncStorage.getItem(`villa_hotel_planner_name_${userId}`);
         if (generation !== hydrateGeneration.current) return;
         setPlannerName(savedName || (currentUser ? `${currentUser.name}'s Celebration` : 'Signature Occasion'));
@@ -251,6 +383,8 @@ function App() {
         if (generation !== hydrateGeneration.current) return;
         console.error('Failed to load state from AsyncStorage', e);
         setItinerary([]);
+        setStays([]);
+        setTransfers([]);
         setPlannerName(currentUser ? `${currentUser.name}'s Celebration` : 'Signature Occasion');
       } finally {
         if (generation === hydrateGeneration.current) {
@@ -297,6 +431,28 @@ function App() {
     return () => clearTimeout(timer);
   }, [itinerary, currentUser, isHydrating]);
 
+  useEffect(() => {
+    if (isHydrating) return;
+    const userId = currentUser ? currentUser.id : 'guest';
+    const timer = setTimeout(() => {
+      AsyncStorage.setItem(`villa_hotel_stays_${userId}`, JSON.stringify(stays)).catch((e) =>
+        console.error('Failed to save stays', e)
+      );
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [stays, currentUser, isHydrating]);
+
+  useEffect(() => {
+    if (isHydrating) return;
+    const userId = currentUser ? currentUser.id : 'guest';
+    const timer = setTimeout(() => {
+      AsyncStorage.setItem(`villa_hotel_transfers_${userId}`, JSON.stringify(transfers)).catch((e) =>
+        console.error('Failed to save transfers', e)
+      );
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [transfers, currentUser, isHydrating]);
+
   const applyGuestItineraryToUser = async (userId: string) => {
     try {
       const guestRaw = await AsyncStorage.getItem('villa_hotel_itinerary_guest');
@@ -320,6 +476,18 @@ function App() {
       if (guestName) {
         await AsyncStorage.setItem(`villa_hotel_planner_name_${userId}`, guestName);
         await AsyncStorage.removeItem('villa_hotel_planner_name_guest');
+      }
+
+      // Carry over package add-ons alongside the itinerary
+      const guestStays = await AsyncStorage.getItem('villa_hotel_stays_guest');
+      if (guestStays) {
+        await AsyncStorage.setItem(`villa_hotel_stays_${userId}`, guestStays);
+        await AsyncStorage.removeItem('villa_hotel_stays_guest');
+      }
+      const guestTransfers = await AsyncStorage.getItem('villa_hotel_transfers_guest');
+      if (guestTransfers) {
+        await AsyncStorage.setItem(`villa_hotel_transfers_${userId}`, guestTransfers);
+        await AsyncStorage.removeItem('villa_hotel_transfers_guest');
       }
     } catch (e) {
       console.error('Failed to migrate guest itinerary', e);
@@ -428,8 +596,8 @@ function App() {
     }
   };
 
-  // Add catalog activity to itinerary
-  const addActivity = (activity: EventActivity) => {
+  // Add a catalog event or curated experience to the itinerary
+  const addActivity = (activity: EventActivity, kind: LineKind = 'event') => {
     const guests = Math.min(10, activity.maxGuests);
     const targetLoc = activity.location === 'Both' ? 'Villa' : activity.location;
     const defaultVenue = VENUES.find((v) => v.type === targetLoc);
@@ -440,10 +608,13 @@ function App() {
       title: activity.title,
       location: targetLoc,
       category: activity.category,
+      kind,
       date: todayISO(),
-      time: '14:00',
+      time: kind === 'experience' ? '16:00' : '14:00',
       guests,
       notes: '',
+      basePrice: activity.basePrice,
+      pricePerGuest: activity.pricePerGuest,
       calculatedPrice: activity.basePrice + activity.pricePerGuest * guests,
       venueId: defaultVenue ? defaultVenue.id : undefined,
       durationMinutes: activity.durationMinutes,
@@ -457,11 +628,100 @@ function App() {
       added = true;
       return [...prev, newItem];
     });
+    const label = kind === 'experience' ? 'experience' : 'itinerary';
     if (added) {
-      Alert.alert('Success', `${activity.title} added to itinerary.`);
+      Alert.alert('Success', `${activity.title} added to ${label}.`);
     } else {
-      Alert.alert('Already Added', 'This activity is already in your itinerary.');
+      Alert.alert('Already Added', `This ${kind} is already in your plan.`);
     }
+  };
+
+  // ----- Stay handlers -----
+  const addStay = () => {
+    const roomType = getRoomType(stayRoomTypeId);
+    if (!roomType) {
+      Alert.alert('Select a room', 'Please choose a valid room type.');
+      return;
+    }
+    if (!isValidISODate(stayCheckIn)) {
+      Alert.alert('Invalid date', 'Enter a check-in date as YYYY-MM-DD.');
+      return;
+    }
+    const nights = Math.min(60, Math.max(1, parseInt(stayNights.replace(/[^\d]/g, ''), 10) || 1));
+    const rooms = Math.min(roomType.count, Math.max(1, parseInt(stayRooms.replace(/[^\d]/g, ''), 10) || 1));
+    const guests = Math.min(
+      roomType.sleeps * rooms,
+      Math.max(1, parseInt(stayGuests.replace(/[^\d]/g, ''), 10) || 1)
+    );
+    const newStay: StayItem = {
+      id: createId('stay'),
+      venueId: stayVenueId,
+      roomTypeId: stayRoomTypeId,
+      checkIn: stayCheckIn,
+      nights,
+      rooms,
+      guests,
+      ratePerNight: roomType.ratePerNight,
+    };
+    setStays((prev) => [...prev, newStay]);
+    setStayModalVisible(false);
+    setStayNights('2');
+    setStayRooms('1');
+    setStayGuests('2');
+    Alert.alert('Success', 'Stay added to your package.');
+  };
+
+  const removeStay = (id: string) => {
+    Alert.alert('Remove stay?', 'This removes the accommodation from your package.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Remove',
+        style: 'destructive',
+        onPress: () => setStays((prev) => prev.filter((s) => s.id !== id)),
+      },
+    ]);
+  };
+
+  // ----- Transfer handlers -----
+  const addTransfer = () => {
+    if (transferFromId === transferToId) {
+      Alert.alert('Choose two venues', 'Origin and destination must be different.');
+      return;
+    }
+    if (!isValidISODate(transferDate)) {
+      Alert.alert('Invalid date', 'Enter a transfer date as YYYY-MM-DD.');
+      return;
+    }
+    if (!isValidTimeHM(transferTime)) {
+      Alert.alert('Invalid time', 'Enter a pickup time as HH:MM.');
+      return;
+    }
+    const pax = Math.min(200, Math.max(1, parseInt(transferPax.replace(/[^\d]/g, ''), 10) || 1));
+    const newTransfer: TransferItem = {
+      id: createId('transfer'),
+      fromVenueId: transferFromId,
+      toVenueId: transferToId,
+      mode: transferMode,
+      date: transferDate,
+      time: transferTime,
+      pax,
+      price: priceTransfer(transferFromId, transferToId, transferMode, pax),
+    };
+    setTransfers((prev) => [...prev, newTransfer]);
+    setTransferModalVisible(false);
+    setTransferPax('2');
+    Alert.alert('Success', 'Transfer added to your package.');
+  };
+
+  const removeTransfer = (id: string) => {
+    Alert.alert('Remove transfer?', 'This removes the transfer from your package.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Remove',
+        style: 'destructive',
+        onPress: () => setTransfers((prev) => prev.filter((t) => t.id !== id)),
+      },
+    ]);
   };
 
   // Remove item from itinerary
@@ -571,7 +831,8 @@ function App() {
   };
 
   // Filter activities for catalog tab
-  const filteredActivities = CATALOG_ACTIVITIES.filter(a => {
+  const catalogSource = catalogMode === 'experiences' ? EXPERIENCES : CATALOG_ACTIVITIES;
+  const filteredActivities = catalogSource.filter(a => {
     const matchesLoc = selectedLocation === 'All' || a.location === selectedLocation || a.location === 'Both';
     const matchesCat = selectedCategory === 'All' || a.category === selectedCategory;
     const matchesSearch = a.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
@@ -580,8 +841,26 @@ function App() {
   });
 
   // Calculate totals
-  const totalCost = itinerary.reduce((sum, item) => sum + item.calculatedPrice, 0);
+  const totals = useMemo(
+    () => computePackageTotals({ itinerary, stays, transfers }),
+    [itinerary, stays, transfers]
+  );
+  const totalCost = totals.grandTotal;
   const peakGuests = itinerary.reduce((max, item) => Math.max(max, item.guests), 0);
+
+  // Live previews for the stay/transfer creation modals
+  const stayRoomTypePreview = getRoomType(stayRoomTypeId);
+  const stayNightsNum = Math.max(1, parseInt(stayNights.replace(/[^\d]/g, ''), 10) || 1);
+  const stayRoomsNum = Math.max(1, parseInt(stayRooms.replace(/[^\d]/g, ''), 10) || 1);
+  const stayPreviewTotal = stayRoomTypePreview
+    ? stayRoomTypePreview.ratePerNight * stayNightsNum * stayRoomsNum
+    : 0;
+  const stayRoomTypesForVenue = roomTypesForVenue(stayVenueId);
+  const transferSameVenue = transferFromId === transferToId;
+  const transferPaxNum = Math.max(1, parseInt(transferPax.replace(/[^\d]/g, ''), 10) || 1);
+  const transferPreviewPrice = transferSameVenue
+    ? 0
+    : priceTransfer(transferFromId, transferToId, transferMode, transferPaxNum);
   const conflicts = useMemo(() => findConflicts(itinerary), [itinerary]);
   const transitGaps = useMemo(() => findTransitGaps(itinerary), [itinerary]);
   const chronologicalItinerary = useMemo(
@@ -834,6 +1113,42 @@ function App() {
           <View style={styles.tabContent}>
             {/* Catalog Filter Controls */}
             <View style={styles.filterSection}>
+              {/* Events vs Experiences toggle */}
+              <View style={styles.catalogModeRow}>
+                <TouchableOpacity
+                  onPress={() => setCatalogMode('events')}
+                  style={[styles.catalogModeBtn, catalogMode === 'events' && styles.catalogModeBtnActive]}
+                >
+                  <Ionicons
+                    name="sparkles-outline"
+                    size={13}
+                    color={catalogMode === 'events' ? '#000' : '#c5a267'}
+                    style={{ marginRight: 5 }}
+                  />
+                  <Text style={[styles.catalogModeText, catalogMode === 'events' && styles.catalogModeTextActive]}>
+                    Events
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setCatalogMode('experiences')}
+                  style={[styles.catalogModeBtn, catalogMode === 'experiences' && styles.catalogModeBtnActive]}
+                >
+                  <Ionicons
+                    name="compass-outline"
+                    size={13}
+                    color={catalogMode === 'experiences' ? '#000' : '#c5a267'}
+                    style={{ marginRight: 5 }}
+                  />
+                  <Text
+                    style={[
+                      styles.catalogModeText,
+                      catalogMode === 'experiences' && styles.catalogModeTextActive,
+                    ]}
+                  >
+                    Experiences
+                  </Text>
+                </TouchableOpacity>
+              </View>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterRow}>
                 {/* Location Selectors */}
                 <TouchableOpacity
@@ -943,12 +1258,14 @@ function App() {
                           style={[styles.addButton, isAdded && styles.addButtonActive]}
                           disabled={isAdded}
                           onPress={() => {
-                            if (!isAdded) addActivity(activity);
+                            if (!isAdded) addActivity(activity, catalogMode === 'experiences' ? 'experience' : 'event');
                           }}
                         >
                           <Ionicons name={isAdded ? "checkmark-circle-outline" : "add-outline"} size={16} color={isAdded ? "#4ade80" : "#000000"} />
                           <Text style={[styles.addButtonText, isAdded && styles.addButtonTextActive]}>
-                            {isAdded ? "Added to Itinerary" : "Add to Itinerary"}
+                            {isAdded
+                              ? catalogMode === 'experiences' ? 'Added to Package' : 'Added to Itinerary'
+                              : catalogMode === 'experiences' ? 'Add to Package' : 'Add to Itinerary'}
                           </Text>
                         </TouchableOpacity>
                       </View>
@@ -967,10 +1284,28 @@ function App() {
             keyboardVerticalOffset={88}
           >
             <View style={styles.itineraryHeader}>
-              <Text style={styles.sectionTitle}>Your Schedule</Text>
+              <Text style={styles.sectionTitle}>Your Package</Text>
               <TouchableOpacity style={styles.bespokeButton} onPress={() => setCustomModalVisible(true)}>
                 <Ionicons name="add-outline" size={14} color="#000" />
                 <Text style={styles.bespokeButtonText}>Custom Event</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Package add-on actions */}
+            <View style={styles.packageActionRow}>
+              <TouchableOpacity
+                style={styles.packageActionBtn}
+                onPress={() => setStayModalVisible(true)}
+              >
+                <Ionicons name="bed-outline" size={15} color="#c5a267" />
+                <Text style={styles.packageActionText}>Add Stay</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.packageActionBtn}
+                onPress={() => setTransferModalVisible(true)}
+              >
+                <Ionicons name="car-sport-outline" size={15} color="#c5a267" />
+                <Text style={styles.packageActionText}>Add Transfer</Text>
               </TouchableOpacity>
             </View>
 
@@ -992,11 +1327,13 @@ function App() {
             )}
 
             <ScrollView contentContainerStyle={styles.scrollList} keyboardShouldPersistTaps="handled">
-              {chronologicalItinerary.length === 0 ? (
+              {chronologicalItinerary.length === 0 && stays.length === 0 && transfers.length === 0 ? (
                 <View style={styles.emptyState}>
                   <Ionicons name="calendar-outline" size={36} color="#666" />
-                  <Text style={styles.emptyStateText}>Your itinerary is empty.</Text>
-                  <Text style={styles.emptyStateSubtext}>Select activities from the catalog tab to get started.</Text>
+                  <Text style={styles.emptyStateText}>Your package is empty.</Text>
+                  <Text style={styles.emptyStateSubtext}>
+                    Add events or experiences from the catalog, or add a stay or transfer above.
+                  </Text>
                 </View>
               ) : (
                 chronologicalItinerary.map(item => {
@@ -1183,6 +1520,89 @@ function App() {
                   </View>
                   );
                 })
+              )}
+
+              {/* Stays */}
+              {stays.length > 0 && (
+                <>
+                  <Text style={styles.packageSectionLabel}>Accommodation</Text>
+                  {stays.map((stay) => {
+                    const venue = VENUES.find((v) => v.id === stay.venueId);
+                    const roomType = getRoomType(stay.roomTypeId);
+                    return (
+                      <View key={stay.id} style={styles.itineraryCard}>
+                        <View style={styles.itineraryCardHeader}>
+                          <View style={{ flex: 1, paddingRight: 8 }}>
+                            <Text style={styles.itineraryCardTitle}>{roomType?.name ?? 'Room'}</Text>
+                            <Text style={styles.itineraryCardMeta}>
+                              {venue?.name ?? 'Venue'} · {formatDisplayDate(stay.checkIn)} →{' '}
+                              {formatDisplayDate(addDaysISO(stay.checkIn, Math.max(1, Math.round(stay.nights))))}
+                            </Text>
+                            <Text style={styles.itineraryCardMeta}>
+                              {stay.nights} night{stay.nights === 1 ? '' : 's'} · {stay.rooms} room
+                              {stay.rooms === 1 ? '' : 's'} · {stay.guests} guest{stay.guests === 1 ? '' : 's'}
+                            </Text>
+                          </View>
+                          <TouchableOpacity
+                            onPress={() => removeStay(stay.id)}
+                            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                            style={{ padding: 8 }}
+                            accessibilityLabel="Remove stay"
+                          >
+                            <Ionicons name="trash-outline" size={18} color="#ef4444" />
+                          </TouchableOpacity>
+                        </View>
+                        <View style={styles.itineraryCostRow}>
+                          <Text style={styles.itineraryCostLabel}>
+                            ${stay.ratePerNight.toLocaleString()}/night
+                          </Text>
+                          <Text style={styles.itineraryCostVal}>${stayLineTotal(stay).toLocaleString()}</Text>
+                        </View>
+                      </View>
+                    );
+                  })}
+                </>
+              )}
+
+              {/* Transfers */}
+              {transfers.length > 0 && (
+                <>
+                  <Text style={styles.packageSectionLabel}>Transfers</Text>
+                  {transfers.map((transfer) => {
+                    const fromVenue = VENUES.find((v) => v.id === transfer.fromVenueId);
+                    const toVenue = VENUES.find((v) => v.id === transfer.toVenueId);
+                    const modeInfo = getTransferMode(transfer.mode);
+                    return (
+                      <View key={transfer.id} style={styles.itineraryCard}>
+                        <View style={styles.itineraryCardHeader}>
+                          <View style={{ flex: 1, paddingRight: 8 }}>
+                            <Text style={styles.itineraryCardTitle}>
+                              {fromVenue?.name ?? 'Origin'} → {toVenue?.name ?? 'Destination'}
+                            </Text>
+                            <Text style={styles.itineraryCardMeta}>
+                              {modeInfo.label} · {formatDisplayDate(transfer.date)} · {transfer.time} ·{' '}
+                              {transfer.pax} pax
+                            </Text>
+                          </View>
+                          <TouchableOpacity
+                            onPress={() => removeTransfer(transfer.id)}
+                            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                            style={{ padding: 8 }}
+                            accessibilityLabel="Remove transfer"
+                          >
+                            <Ionicons name="trash-outline" size={18} color="#ef4444" />
+                          </TouchableOpacity>
+                        </View>
+                        <View style={styles.itineraryCostRow}>
+                          <Text style={styles.itineraryCostLabel}>Coastal transfer</Text>
+                          <Text style={styles.itineraryCostVal}>
+                            ${transferLineTotal(transfer).toLocaleString()}
+                          </Text>
+                        </View>
+                      </View>
+                    );
+                  })}
+                </>
               )}
             </ScrollView>
           </KeyboardAvoidingView>
@@ -1515,16 +1935,68 @@ function App() {
               </View>
 
               <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>Total Events Scheduled</Text>
-                <Text style={styles.summaryValue}>{itinerary.length}</Text>
+                <Text style={styles.summaryLabel}>Events Scheduled</Text>
+                <Text style={styles.summaryValue}>{totals.eventCount}</Text>
               </View>
+              {totals.experienceCount > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Experiences</Text>
+                  <Text style={styles.summaryValue}>{totals.experienceCount}</Text>
+                </View>
+              )}
+              {totals.stayCount > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Stays ({totals.roomNights} room-nights)</Text>
+                  <Text style={styles.summaryValue}>{totals.stayCount}</Text>
+                </View>
+              )}
+              {totals.transferCount > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Transfers</Text>
+                  <Text style={styles.summaryValue}>{totals.transferCount}</Text>
+                </View>
+              )}
               <View style={styles.summaryRow}>
                 <Text style={styles.summaryLabel}>Peak Guest Count</Text>
                 <Text style={styles.summaryValue}>{peakGuests} guests</Text>
               </View>
+
+              {/* Package cost breakdown */}
+              {totals.eventsTotal > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Events</Text>
+                  <Text style={styles.summaryValue}>${totals.eventsTotal.toLocaleString()}</Text>
+                </View>
+              )}
+              {totals.experiencesTotal > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Experiences</Text>
+                  <Text style={styles.summaryValue}>${totals.experiencesTotal.toLocaleString()}</Text>
+                </View>
+              )}
+              {totals.staysTotal > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Accommodation</Text>
+                  <Text style={styles.summaryValue}>${totals.staysTotal.toLocaleString()}</Text>
+                </View>
+              )}
+              {totals.transfersTotal > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Transfers</Text>
+                  <Text style={styles.summaryValue}>${totals.transfersTotal.toLocaleString()}</Text>
+                </View>
+              )}
               <View style={styles.summaryRow}>
                 <Text style={styles.summaryLabel}>Total Estimated Cost</Text>
                 <Text style={[styles.summaryValue, { color: '#c5a267', fontSize: 18 }]}>${totalCost.toLocaleString()}</Text>
+              </View>
+              <View style={styles.summaryRow}>
+                <Text style={styles.summaryLabel}>
+                  Deposit to reserve ({Math.round(totals.depositPct * 100)}%)
+                </Text>
+                <Text style={[styles.summaryValue, { color: '#4ade80' }]}>
+                  ${totals.deposit.toLocaleString()}
+                </Text>
               </View>
               {targetBudget > 0 && (
                 <View style={styles.summaryRow}>
@@ -1818,6 +2290,305 @@ function App() {
                 <Text style={styles.modalSubmitBtnText}>Save Name</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Add Stay Modal */}
+      <Modal visible={stayModalVisible} animationType="slide" transparent>
+        <KeyboardAvoidingView
+          style={styles.modalOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Add Accommodation</Text>
+              <TouchableOpacity
+                onPress={() => setStayModalVisible(false)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Ionicons name="close" size={20} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.modalForm} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalLabel}>Property</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={{ paddingVertical: 4 }}
+                style={{ flexDirection: 'row', marginBottom: 12 }}
+              >
+                {VENUES.map((v) => (
+                  <TouchableOpacity
+                    key={v.id}
+                    onPress={() => setStayVenueId(v.id)}
+                    style={[
+                      styles.venuePillMobile,
+                      stayVenueId === v.id && styles.venuePillMobileActive,
+                      { marginRight: 8 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.venuePillMobileText,
+                        stayVenueId === v.id && styles.venuePillMobileTextActive,
+                      ]}
+                    >
+                      {v.name}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <Text style={styles.modalLabel}>Room Type</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={{ paddingVertical: 4 }}
+                style={{ flexDirection: 'row', marginBottom: 12 }}
+              >
+                {stayRoomTypesForVenue.map((r) => (
+                  <TouchableOpacity
+                    key={r.id}
+                    onPress={() => setStayRoomTypeId(r.id)}
+                    style={[
+                      styles.venuePillMobile,
+                      stayRoomTypeId === r.id && styles.venuePillMobileActive,
+                      { marginRight: 8 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.venuePillMobileText,
+                        stayRoomTypeId === r.id && styles.venuePillMobileTextActive,
+                      ]}
+                    >
+                      {r.name} · ${r.ratePerNight.toLocaleString()}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+              {stayRoomTypePreview?.description ? (
+                <Text style={styles.modalHelperText}>{stayRoomTypePreview.description}</Text>
+              ) : null}
+
+              <Text style={styles.modalLabel}>Check-in Date (YYYY-MM-DD)</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={stayCheckIn}
+                onChangeText={setStayCheckIn}
+                placeholder="2026-07-20"
+                placeholderTextColor="#555"
+                autoCapitalize="none"
+              />
+
+              <View style={styles.modalInputsRow}>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={styles.modalLabel}>Nights</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    keyboardType="number-pad"
+                    value={stayNights}
+                    onChangeText={setStayNights}
+                  />
+                </View>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={styles.modalLabel}>Rooms</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    keyboardType="number-pad"
+                    value={stayRooms}
+                    onChangeText={setStayRooms}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.modalLabel}>Guests</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    keyboardType="number-pad"
+                    value={stayGuests}
+                    onChangeText={setStayGuests}
+                  />
+                </View>
+              </View>
+
+              <Text style={styles.modalPreviewText}>
+                {stayNightsNum} night{stayNightsNum === 1 ? '' : 's'} × {stayRoomsNum} room
+                {stayRoomsNum === 1 ? '' : 's'} ={' '}
+                <Text style={{ color: '#c5a267', fontWeight: '700' }}>
+                  ${stayPreviewTotal.toLocaleString()}
+                </Text>
+              </Text>
+
+              <TouchableOpacity style={styles.modalSubmitBtn} onPress={addStay}>
+                <Text style={styles.modalSubmitBtnText}>Add Stay</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Add Transfer Modal */}
+      <Modal visible={transferModalVisible} animationType="slide" transparent>
+        <KeyboardAvoidingView
+          style={styles.modalOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Add Transfer</Text>
+              <TouchableOpacity
+                onPress={() => setTransferModalVisible(false)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Ionicons name="close" size={20} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.modalForm} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalLabel}>From</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={{ paddingVertical: 4 }}
+                style={{ flexDirection: 'row', marginBottom: 12 }}
+              >
+                {VENUES.map((v) => (
+                  <TouchableOpacity
+                    key={v.id}
+                    onPress={() => setTransferFromId(v.id)}
+                    style={[
+                      styles.venuePillMobile,
+                      transferFromId === v.id && styles.venuePillMobileActive,
+                      { marginRight: 8 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.venuePillMobileText,
+                        transferFromId === v.id && styles.venuePillMobileTextActive,
+                      ]}
+                    >
+                      {v.name}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <Text style={styles.modalLabel}>To</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={{ paddingVertical: 4 }}
+                style={{ flexDirection: 'row', marginBottom: 12 }}
+              >
+                {VENUES.map((v) => (
+                  <TouchableOpacity
+                    key={v.id}
+                    onPress={() => setTransferToId(v.id)}
+                    style={[
+                      styles.venuePillMobile,
+                      transferToId === v.id && styles.venuePillMobileActive,
+                      { marginRight: 8 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.venuePillMobileText,
+                        transferToId === v.id && styles.venuePillMobileTextActive,
+                      ]}
+                    >
+                      {v.name}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <Text style={styles.modalLabel}>Vehicle</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={{ paddingVertical: 4 }}
+                style={{ flexDirection: 'row', marginBottom: 12 }}
+              >
+                {TRANSFER_MODES.map((m) => (
+                  <TouchableOpacity
+                    key={m.id}
+                    onPress={() => setTransferMode(m.id)}
+                    style={[
+                      styles.venuePillMobile,
+                      transferMode === m.id && styles.venuePillMobileActive,
+                      { marginRight: 8 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.venuePillMobileText,
+                        transferMode === m.id && styles.venuePillMobileTextActive,
+                      ]}
+                    >
+                      {m.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+              <Text style={styles.modalHelperText}>{getTransferMode(transferMode).note}</Text>
+
+              <View style={styles.modalInputsRow}>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={styles.modalLabel}>Date (YYYY-MM-DD)</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    value={transferDate}
+                    onChangeText={setTransferDate}
+                    placeholder="2026-07-20"
+                    placeholderTextColor="#555"
+                    autoCapitalize="none"
+                  />
+                </View>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={styles.modalLabel}>Time</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    value={transferTime}
+                    onChangeText={setTransferTime}
+                    placeholder="12:00"
+                    placeholderTextColor="#555"
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.modalLabel}>Pax</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    keyboardType="number-pad"
+                    value={transferPax}
+                    onChangeText={setTransferPax}
+                  />
+                </View>
+              </View>
+
+              <Text style={styles.modalPreviewText}>
+                {transferSameVenue ? (
+                  <Text style={{ color: '#ef4444' }}>Choose two different venues</Text>
+                ) : (
+                  <>
+                    Estimated ={' '}
+                    <Text style={{ color: '#c5a267', fontWeight: '700' }}>
+                      ${transferPreviewPrice.toLocaleString()}
+                    </Text>
+                  </>
+                )}
+              </Text>
+
+              <TouchableOpacity
+                style={[styles.modalSubmitBtn, transferSameVenue && { opacity: 0.5 }]}
+                onPress={addTransfer}
+                disabled={transferSameVenue}
+              >
+                <Text style={styles.modalSubmitBtnText}>Add Transfer</Text>
+              </TouchableOpacity>
+            </ScrollView>
           </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -2396,6 +3167,77 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#000000',
     marginLeft: 2,
+  },
+  catalogModeRow: {
+    flexDirection: 'row',
+    backgroundColor: '#0d0d0d',
+    borderWidth: 1,
+    borderColor: '#1c1917',
+    borderRadius: 10,
+    padding: 4,
+    marginBottom: 10,
+  },
+  catalogModeBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
+    borderRadius: 7,
+  },
+  catalogModeBtnActive: {
+    backgroundColor: '#c5a267',
+  },
+  catalogModeText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#c5a267',
+  },
+  catalogModeTextActive: {
+    color: '#000000',
+  },
+  packageActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  packageActionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#121212',
+    borderWidth: 1,
+    borderColor: '#2a2416',
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  packageActionText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#c5a267',
+    marginLeft: 6,
+  },
+  packageSectionLabel: {
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+    color: '#c5a267',
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  modalHelperText: {
+    fontSize: 11,
+    color: '#8a8a8a',
+    fontStyle: 'italic',
+    marginBottom: 12,
+    marginTop: -4,
+  },
+  modalPreviewText: {
+    fontSize: 12,
+    color: '#bbbbbb',
+    marginBottom: 14,
   },
   itineraryCard: {
     backgroundColor: '#121212',

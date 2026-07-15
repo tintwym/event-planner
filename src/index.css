@@ -79,6 +79,15 @@ html {
 
 @import "./print.css";
 
+/* Hide scrollbars on horizontal chip / date rows (kept scrollable) */
+@utility scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 /* Respect OS / browser reduced-motion preferences */
 @media (prefers-reduced-motion: reduce) {
   *,
